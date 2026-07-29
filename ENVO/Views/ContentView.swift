@@ -8,6 +8,7 @@ struct ContentView: View {
     @EnvironmentObject var engine: EnvoEngine
 
     @State private var showPermissionAlert = false
+    @State private var startFailureMessage: String?
     @State private var showCalibration = false
     @State private var showInfo = false
     @State private var showOnboarding = false
@@ -114,6 +115,13 @@ struct ContentView: View {
         } message: {
             Text("ENVO needs microphone access to measure ambient noise. No audio is recorded or stored.")
         }
+        .alert("ENVO Could Not Start",
+               isPresented: Binding(get: { startFailureMessage != nil },
+                                    set: { if !$0 { startFailureMessage = nil } })) {
+            Button("OK", role: .cancel) { startFailureMessage = nil }
+        } message: {
+            Text(startFailureMessage ?? "")
+        }
         .sheet(isPresented: $showCalibration) {
             CalibrationView()
                 .environmentObject(audioManager)
@@ -209,22 +217,12 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .accessibilityLabel(engine.isCalibrated ? "Recalibrate room" : "Calibrate room")
 
-            // Gap badge
-            if engine.gapDetected {
-                Text("GAP")
-                    .font(.envo(size: 9))
-                    .foregroundColor(.white)
-                    .kerning(2)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 6)
-                    .background(Color.white.opacity(0.15))
-                    .overlay(
-                        Rectangle()
-                            .stroke(Color.white.opacity(0.4), lineWidth: 1)
-                    )
-                    .transition(.opacity)
-                    .animation(.easeInOut(duration: 0.2), value: engine.gapDetected)
-            }
+            // The GAP badge used to live here. It reported a diagnostic that
+            // stopped meaning anything once ambient tracking no longer needed
+            // pauses in playback to read the room — and with nothing playing it
+            // was simply lit the whole time. The detection it was based on is
+            // still running; it now only feeds the RECAL? hint on the button
+            // above, which is a conclusion rather than a raw signal.
         }
     }
 
@@ -234,26 +232,27 @@ struct ContentView: View {
 
     private var readoutView: some View {
         GeometryReader { geo in
-            let w = geo.size.width
-            let sideW = w * 0.30   // NOISE and ADJ each get 30%
-            let midW = w * 0.40    // VOL gets 40% (room for "100 %")
+            // Three equal columns. The two 1pt dividers are taken out of the
+            // total first, so each value block is centred in a genuinely equal
+            // share rather than sitting slightly off-centre.
+            let columnW = (geo.size.width - 2) / 3
 
             HStack(spacing: 0) {
                 // ── NOISE / AMBIENT ──
                 VStack(spacing: 4) {
-                    Text(engine.isCalibrated ? "AMBIENT" : "NOISE")
+                    Text(engine.isActive ? "AMBIENT" : "NOISE")
                         .font(.envo(size: 9))
                         .foregroundColor(.gray)
                         .kerning(2)
 
                     readoutNumber(
-                        value: "\(engine.isCalibrated && engine.isActive ? engine.displayAmbient : audioManager.approximateDB)",
+                        value: noiseReadoutValue,
                         unit: "dB"
                     )
                 }
-                .frame(width: sideW, alignment: .center)
+                .frame(width: columnW, alignment: .center)
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("Noise \(audioManager.approximateDB) decibels")
+                .accessibilityLabel(noiseAccessibilityLabel)
 
                 // Divider
                 Rectangle()
@@ -272,7 +271,7 @@ struct ContentView: View {
                         unit: "%"
                     )
                 }
-                .frame(width: midW, alignment: .center)
+                .frame(width: columnW, alignment: .center)
                 .accessibilityElement(children: .combine)
                 .accessibilityLabel("Volume \(displayBaseVolume) percent")
 
@@ -282,21 +281,36 @@ struct ContentView: View {
                     .frame(width: 1, height: 50)
 
                 // ── ADJ ──
+                // Shown in decibels, with the unit. This used to print the
+                // slider offset as a bare percentage, so a 14% slider move
+                // read as "-14" and was naturally taken for -14 dB.
                 VStack(spacing: 4) {
                     Text("ADJ")
                         .font(.envo(size: 9))
                         .foregroundColor(.gray)
                         .kerning(2)
 
-                    Text(engine.displayOffset)
-                        .font(.envo(size: 38))
-                        .foregroundColor(offsetColor)
-                        .kerning(2)
-                        .monospacedDigit()
+                    HStack(alignment: .lastTextBaseline, spacing: 2) {
+                        Text(engine.displayOffset)
+                            .font(.envo(size: 38))
+                            .foregroundColor(offsetColor)
+                            // Half the tracking of the other readouts: this
+                            // value carries a sign and a decimal, so the wider
+                            // spacing pushed it out of balance with them.
+                            .kerning(1)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.5)
+
+                        Text("dB")
+                            .font(.envo(size: 12))
+                            .foregroundColor(.gray)
+                            .kerning(1)
+                    }
                 }
-                .frame(width: sideW, alignment: .center)
+                .frame(width: columnW, alignment: .center)
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("Adjustment \(engine.displayOffset)")
+                .accessibilityLabel("Adjustment \(engine.displayOffset) decibels")
             }
         }
         .frame(height: 70)
@@ -311,6 +325,8 @@ struct ContentView: View {
                 .foregroundColor(.white)
                 .kerning(2)
                 .monospacedDigit()
+                .lineLimit(1)
+                .minimumScaleFactor(0.5)
 
             Text(unit)
                 .font(.envo(size: 12))
@@ -320,9 +336,9 @@ struct ContentView: View {
     }
 
     private var offsetColor: Color {
-        let offset = engine.currentOffset
-        if offset > 0.01 { return .white }
-        if offset < -0.01 { return .gray }
+        let offsetDB = engine.currentOffsetDB
+        if offsetDB > 0.05 { return .white }
+        if offsetDB < -0.05 { return .gray }
         return .white.opacity(0.5)
     }
 
@@ -549,12 +565,12 @@ struct ContentView: View {
 
                         infoSection(
                             title: "CONTROLS",
-                            body: "RESPONSE sets how quickly ENVO reacts: SLOW averages over 60 seconds, MED over 30, and FAST over 10. RANGE limits how much adjustment is applied: ±3dB, ±6dB, or ±9dB. DIR controls the direction of adjustment. Enable + to allow volume increases, – for decreases, or both."
+                            body: "RESPONSE sets how quickly ENVO reacts: SLOW averages over 60 seconds, MED over 30, and FAST over 10. RANGE is a hard limit on the adjustment, not a sensitivity: ±3dB, ±6dB or ±9dB is the most ENVO will ever move, in either direction. DIR controls the direction of adjustment. Enable + to allow volume increases, – for decreases, or both."
                         )
 
                         infoSection(
                             title: "CALIBRATION",
-                            body: "For best results, calibrate ENVO to your room and setup. Calibration plays a test noise at several volume levels and measures how your device speaker sounds to the microphone. This allows ENVO to separate your music from actual ambient noise, preventing feedback loops. Calibration takes about 30 seconds and is saved until you recalibrate."
+                            body: "For best results, calibrate ENVO to your room and setup. Calibration plays a test noise at several volume levels and measures how your device speaker sounds to the microphone. This does two things: it lets ENVO separate your music from actual ambient noise, and it measures how much real loudness each step of your volume slider produces. Until you calibrate, ENVO assumes a deliberately cautious volume curve and will adjust by somewhat less than the range you selected. Calibration takes about 35 seconds and is saved until you recalibrate."
                         )
 
                         infoSection(
@@ -648,12 +664,46 @@ struct ContentView: View {
         Int((volumeController.baseVolume * 100).rounded())
     }
 
+    /// NOISE/AMBIENT readout. The mic doesn't run in standby, so a number
+    /// there would be a frozen lie — show an honest idle placeholder instead.
+    /// "—" now also covers the case where our own playback is masking the
+    /// room, which is a real state the engine can be in rather than something
+    /// to paper over with a stale number.
+    /// While ENVO is running this shows the **ambient floor** — the quantity
+    /// the engine actually steers on — for calibrated and uncalibrated alike.
+    ///
+    /// It previously showed the raw microphone level whenever uncalibrated,
+    /// which includes your own playback. On a phone playing music that reads
+    /// tens of dB above the room: a quiet room could display 90+ dB, which is
+    /// simply a different measurement than the label promises.
+    private var noiseReadoutValue: String {
+        if engine.isActive {
+            guard let ambient = engine.displayAmbient else { return "—" }
+            return "\(ambient)"
+        }
+        // Calibration runs the mic without the engine; the raw level is the
+        // only thing available then, and it is what calibration measures.
+        if audioManager.isMonitoring {
+            return "\(audioManager.approximateDB)"
+        }
+        return "—"
+    }
+
+    private var noiseAccessibilityLabel: String {
+        noiseReadoutValue == "—"
+            ? "Noise idle, not measuring"
+            : "Noise \(noiseReadoutValue) decibels"
+    }
+
     /// What the visualizer should pulse to. Raw mic when uncalibrated /
     /// inactive (so the user can still see ENVO is "listening"); estimated
     /// ambient otherwise, so the visual matches what's driving the offset.
+    /// Falls back to the raw mic level while the ambient estimate is
+    /// unavailable (playback masking the room), so the visualizer keeps
+    /// showing that ENVO is listening instead of collapsing to nothing.
     private var visualizerLevel: Float {
-        if engine.isActive && engine.isCalibrated {
-            return engine.estimatedAmbient
+        if engine.isActive, engine.estimatedAmbientDB != nil {
+            return engine.visualizerLevel
         }
         return audioManager.normalizedLevel
     }
@@ -696,6 +746,19 @@ struct ContentView: View {
         }
     }
 
+    /// Starts the engine and surfaces the reason if it refused. `start()` has
+    /// several legitimate ways to decline (no permission, calibration running,
+    /// session unavailable) and previously did all of them silently, so a tap
+    /// on START could appear to do nothing at all.
+    private func startEngineReportingFailure() {
+        Haptics.bump()
+        engine.start()
+        if !engine.isActive, let reason = engine.lastStartFailure {
+            Haptics.warning()
+            startFailureMessage = reason
+        }
+    }
+
     private func toggleEngine() {
         if engine.isActive {
             Haptics.bump()
@@ -703,8 +766,7 @@ struct ContentView: View {
             return
         }
         if audioManager.permissionGranted {
-            Haptics.bump()
-            engine.start()
+            startEngineReportingFailure()
             return
         }
         // Ask for permission and start only AFTER the user has answered the
@@ -712,8 +774,7 @@ struct ContentView: View {
         // 0.5s timer and could show our fallback alert on top of it.
         audioManager.checkPermission { granted in
             if granted {
-                Haptics.bump()
-                engine.start()
+                startEngineReportingFailure()
             } else {
                 Haptics.warning()
                 showPermissionAlert = true

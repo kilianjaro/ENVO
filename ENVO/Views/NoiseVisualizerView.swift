@@ -7,6 +7,11 @@ struct NoiseVisualizerView: View {
     let isActive: Bool
     let levelHistory: [Float]
 
+    /// The app runs for long stretches in the background (audio mode) with
+    /// this view still alive. Animation work must stop there — the screen
+    /// isn't visible and the 30 Hz redraws are pure battery drain.
+    @Environment(\.scenePhase) private var scenePhase
+
     @State private var phase: Double = 0.0
 
     /// The display level used for rendering. Rises instantly with noise
@@ -46,6 +51,7 @@ struct NoiseVisualizerView: View {
             }
         }
         .onReceive(timer) { _ in
+            guard scenePhase == .active else { return }
             guard isActive else {
                 displayLevel = 0
                 peakLevel = 0

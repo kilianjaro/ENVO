@@ -72,6 +72,20 @@ struct CalibrationView: View {
                 calibrationStore: calibrationStore
             )
         }
+        .onDisappear {
+            // However the sheet goes away, a run in flight must be torn down:
+            // it holds the audio session, blocks the engine from starting, and
+            // is midway through a volume sweep.
+            if CalibrationManager.isCalibrating {
+                calibrationManager.cancelCalibration()
+            }
+            // Calibration started the mic; nothing else stops it. Without
+            // this the input engine (and the orange mic indicator) stays on
+            // after the sheet closes even though ENVO is in standby.
+            if !engine.isActive {
+                audioManager.stopMonitoring()
+            }
+        }
         .interactiveDismissDisabled(hasStarted && calibrationManager.state != .finished)
     }
 
@@ -88,7 +102,7 @@ struct CalibrationView: View {
                 instructionRow("1", "Place your device where you normally use it.")
                 instructionRow("2", "Keep the room as quiet as possible during calibration.")
                 instructionRow("3", "ENVO will play a test tone at different volumes and measure how your speaker sounds to the microphone.")
-                instructionRow("4", "This takes about 30 seconds.")
+                instructionRow("4", "This takes about 35 seconds.")
             }
             .padding(16)
             .overlay(
@@ -146,13 +160,11 @@ struct CalibrationView: View {
     }
 
     private var isExternalOutputRoute: Bool {
-        AVAudioSession.sharedInstance().currentRoute.outputs.contains {
-            $0.portType != .builtInSpeaker && $0.portType != .builtInReceiver
-        }
+        AudioSessionController.shared.isExternalOutputRoute
     }
 
     private var currentOutputName: String {
-        AVAudioSession.sharedInstance().currentRoute.outputs.first?.portName ?? "an external device"
+        AudioSessionController.shared.currentOutputName
     }
 
     private func instructionRow(_ number: String, _ text: String) -> some View {

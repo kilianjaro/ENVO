@@ -36,14 +36,14 @@ final class NowPlayingController: ObservableObject {
             }
             .store(in: &cancellables)
 
-        engine.$currentOffset
+        engine.$currentOffsetDB
             .throttle(for: .seconds(0.5), scheduler: RunLoop.main, latest: true)
             .sink { [weak self] _ in
                 self?.refresh()
             }
             .store(in: &cancellables)
 
-        engine.$estimatedAmbient
+        engine.$estimatedAmbientDB
             .throttle(for: .seconds(0.5), scheduler: RunLoop.main, latest: true)
             .sink { [weak self] _ in
                 self?.refresh()
@@ -108,12 +108,9 @@ final class NowPlayingController: ObservableObject {
         guard let engine = engine, engine.isActive else { return }
 
         let center = MPNowPlayingInfoCenter.default()
-        let offsetPct = Int((engine.currentOffset * 100).rounded())
-        let subtitle: String = {
-            if offsetPct > 0 { return "+\(offsetPct)% · ambient \(engine.displayAmbient) dB" }
-            if offsetPct < 0 { return "\(offsetPct)% · ambient \(engine.displayAmbient) dB" }
-            return "ambient \(engine.displayAmbient) dB"
-        }()
+        let ambient = engine.displayAmbient.map { "ambient \($0) dB" } ?? "ambient —"
+        let offset = engine.displayOffset
+        let subtitle = offset == "0.0" ? ambient : "\(offset) dB · \(ambient)"
 
         var info: [String: Any] = [:]
         info[MPMediaItemPropertyTitle] = "ENVO — adapting volume"

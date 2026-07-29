@@ -28,7 +28,13 @@ enum RangeMode: String, CaseIterable, Identifiable, Codable {
 
     var id: String { rawValue }
 
-    /// Maximum offset in dB (consumed by VolumeMath at apply time).
+    /// Maximum adjustment in dB, in either direction.
+    ///
+    /// This is a **limit, not a gain**. The previous implementation folded
+    /// this value into the control law's sensitivity, so choosing a wider
+    /// range also made ENVO react more aggressively — two different things
+    /// behind one control. Sensitivity is now `compensationGain` below and
+    /// is independent of this setting.
     var maxOffsetDB: Float {
         switch self {
         case .quiet:  return 3.0
@@ -40,6 +46,20 @@ enum RangeMode: String, CaseIterable, Identifiable, Codable {
 
 // MARK: - Engine
 
+/// The control loop.
+///
+/// UNITS
+/// -----
+/// Everything in this file is in **decibels** unless the name says
+/// `slider`. The engine's control variable is `currentOffsetDB` — how much
+/// louder or quieter than the user's baseline ENVO currently wants to be.
+/// Converting that intent into slider movement is `VolumeTaper`'s job and
+/// happens exactly once, at the point of application.
+///
+/// That separation is the fix for the range-bound leak: the old code clamped
+/// its intent to ±rangeDB correctly, then converted to a slider delta with a
+/// curve that assumed the iOS slider is proportional to amplitude. The clamp
+/// was real; the conversion threw the bound away.
 final class EnvoEngine: ObservableObject {
 
     // MARK: - Published State (UI-facing)
@@ -51,15 +71,28 @@ final class EnvoEngine: ObservableObject {
     @Published var allowIncrease: Bool = true
     @Published var allowDecrease: Bool = true
 
-    @Published private(set) var currentOffset: Float = 0.0
-    @Published private(set) var levelHistory: [Float] = []
-    @Published private(set) var estimatedAmbient: Float = 0.0
-    @Published private(set) var gapDetected: Bool = false
+    /// Current adjustment in dB — the number the UI shows. The old ADJ
+    /// readout printed `sliderOffset × 100` with no unit, which users
+    /// reasonably read as decibels; a "-14" there was a 14% slider move.
+    @Published private(set) var currentOffsetDB: Float = 0.0
 
-    /// True when the live silence-floor reading deviates significantly
-    /// from the calibrated silenceFloor (room has changed materially).
-    /// UI surfaces this as a "recalibrate?" hint.
+    /// Current adjustment as slider travel, for diagnostics.
+    @Published private(set) var currentSliderOffset: Float = 0.0
+
+    /// Estimated room level in dBFS, or nil while the estimate is not
+    /// trustworthy (mic dead, or our own playback masking the room).
+    @Published private(set) var estimatedAmbientDB: Float?
+
+    /// Normalized 0…1 history for the visualizer. Display only.
+    @Published private(set) var levelHistory: [Float] = []
+
+    /// True when the live room floor disagrees materially with the calibrated
+    /// one. Surfaced as a "recalibrate?" hint.
     @Published private(set) var calibrationStale: Bool = false
+
+    /// Set when START could not proceed, so the UI can say why instead of
+    /// silently doing nothing.
+    @Published private(set) var lastStartFailure: String?
 
     // MARK: - Dependencies (injected)
 
@@ -68,53 +101,114 @@ final class EnvoEngine: ObservableObject {
     let calibrationStore: CalibrationStore
     let settings: SettingsStore
 
-    /// Convenience for the UI / status row.
     var isCalibrated: Bool { calibrationStore.isCalibrated }
 
-    // MARK: - Private
+    /// The taper in force right now: measured when a valid profile exists for
+    /// the current output route, the conservative default otherwise.
+    var activeTaper: VolumeTaper {
+        guard let profile = calibrationStore.profile, profile.isUsable else {
+            return .default
+        }
+        return profile.applicableTaper
+    }
+
+    // MARK: - Control law constants
+
+    /// How many dB of volume change ENVO applies per dB of ambient change.
+    ///
+    /// Full compensation (1.0) is wrong: rooms get louder partly *because*
+    /// listeners raise their voices, and matching a noisy room dB-for-dB
+    /// produces an arms race. Partial compensation in the 0.3–0.5 range is
+    /// the established behaviour for automotive and hearing-aid volume
+    /// compensation, and it is what makes the result feel like it is holding
+    /// the music steady rather than chasing the room.
+    /// Applies whether or not a profile exists. The ambient floor is now
+    /// measured the same way in both cases (see AmbientTracker), so there is
+    /// no longer a reason for the loop to behave differently — what
+    /// calibration buys is dB *accuracy* via the measured taper, plus gap and
+    /// staleness reporting.
+    private let compensationGain: Float = 0.40
+
+    /// Smoothing retention on the dB intent, per 1 Hz tick.
+    private let offsetSmoothing: Float = 0.85
+
+    /// Anti-Lombard correction. See LombardDamper for why it can only ever
+    /// make ENVO do less, never more.
+    private let lombardDamper = LombardDamper()
+
+    /// Dead band. Below this the adjustment is snapped to zero rather than
+    /// micro-nudged. 0.5 dB is under the just-noticeable difference for
+    /// music, so this costs nothing audible and stops the volume creeping
+    /// around by fractions of a step all evening.
+    private let zeroHysteresisDB: Float = 0.5
+
+    /// Maximum rate of change of the adjustment. Slow enough that the change
+    /// is not perceived as an event, which is the entire point of the app.
+    let maxRateDBPerSecond: Float = 0.75
+
+    /// Hard ceiling on the resulting system volume. ENVO never pushes above
+    /// this no matter how loud the room gets.
+    let safetyCeiling: Float = 0.92
+
+    // MARK: - Private state
 
     private var cancellables = Set<AnyCancellable>()
     private var engineTimer: Timer?
 
-    private var ambientSamples: [Float] = []
-    private let maxSampleCount: Int = 600
-    private var baselineAmbient: Float = 0.0
-    private var hasBaseline: Bool = false
-    private var lastGapAmbient: Float?
-    private var lastGapTime: Date = .distantPast
-    /// How long a gap-derived ambient reading stays authoritative. Beyond
-    /// this the room may have changed without another playback gap, so the
-    /// estimate falls back to the calibration-subtraction path alone.
-    private let gapAmbientTTL: TimeInterval = 120
-    private var recentMicLevels: [Float] = []
-    private let gapWindowSize: Int = 5
-    private let gapThreshold: Float = 1.4
     private let sampleInterval: TimeInterval = 1.0
-    private var lastAppliedOffset: Float = 0.0
-    private let offsetChangeThreshold: Float = 0.004
 
-    /// DELIBERATE dead-band. Because the zero-snap runs on the smoothed
-    /// per-tick step, an offset only starts moving from zero when the
-    /// intended offset exceeds zeroHysteresis / (1 − smoothing) — about
-    /// ±1 dB calibrated, ±1.7 dB uncalibrated at 50% base volume. Ambient
-    /// shifts below that are ignored entirely instead of micro-nudging
-    /// the volume. Tune together with the smoothing constants.
-    private let zeroHysteresis: Float = 0.008
+    /// Rolling microphone history, from which the ambient floor is derived.
+    private var ambientTracker = AmbientTracker(percentile: 0.2,
+                                                minimumSamples: 5,
+                                                capacity: 60)
 
-    /// Maximum |Δoffset| per second on the 0–1 slider scale.
-    /// At 1s tick rate this also caps the per-tick change.
-    let maxOffsetRatePerSecond: Float = 0.04
+    /// Estimated-ambient history, for the visualizer.
+    private var ambientSamplesDB: [Float] = []
+    private let maxSampleCount = 600
 
-    /// Hard ceiling for the resulting volume. ENVO never pushes the
-    /// system volume above this regardless of ambient noise (A6).
-    let safetyCeiling: Float = 0.92
+    /// The room level ENVO is compensating relative to: the room as it was
+    /// when START was pressed. Deliberately does NOT drift — a drifting
+    /// baseline means a sustained loud room eventually reads as "normal"
+    /// again and the compensation quietly evaporates. It is re-anchored only
+    /// when the user manually changes the volume, which is them restating
+    /// what "normal" means.
+    private var baselineAmbientDB: Float = 0
+    private var hasBaseline = false
+    private var warmupTicks = 0
 
-    private var spikeFilter = SpikeFilter()
+    /// Ticks of history before the baseline is fixed. Long enough for the
+    /// percentile floor to be meaningful, short enough that START feels like
+    /// it did something.
+    private let warmupCount = 8
 
-    private var uncalibratedSmoothing: Float = 0.92
-    private var calibratedSmoothing: Float = 0.85
+    /// Rolling raw-level window used to spot stretches quiet enough to compare
+    /// against the calibrated silence floor. See `checkCalibrationDrift`.
+    private var recentRawDB: [Float] = []
+    private let gapWindowSize = 5
 
-    private var runGeneration: UInt64 = 0
+    /// A stretch counts as clean when the mic hears nothing beyond what we
+    /// believe the room to be, plus this margin. Additive, because the
+    /// quantity is a decibel value — the old code multiplied the floor by 1.4,
+    /// which meant +1 dB at a floor of 0.05 and +11 dB at a floor of 0.5, an
+    /// effectively random threshold that fired on nearly every tick.
+    private let gapMarginDB: Float = 3.0
+
+    /// Consecutive clean observations disagreeing with the calibrated floor
+    /// before the stale hint appears, so the button label cannot flicker.
+    private let staleConfirmations = 4
+    private let staleThresholdDB: Float = 6.0
+    private var staleStreak = 0
+
+    private var appliedSliderOffset: Float = 0.0
+    private let sliderChangeThreshold: Float = 0.004
+
+    /// Consecutive ticks with a dead mic, for logging only — the offset is
+    /// held regardless.
+    private var deadMicTicks = 0
+
+    private var spikeFilter = SpikeFilter(windowSize: 12, spikeRatio: 2.5, minimumMargin: 1.0)
+
+    private var routeChangeToken: NSObjectProtocol?
 
     // MARK: - Lifecycle
 
@@ -127,43 +221,48 @@ final class EnvoEngine: ObservableObject {
         self.calibrationStore = calibrationStore
         self.settings = settings
 
-        // Seed published state from persisted settings.
         self.speedMode      = settings.speedMode
         self.rangeMode      = settings.rangeMode
         self.allowIncrease  = settings.allowIncrease
         self.allowDecrease  = settings.allowDecrease
 
-        // Republish calibration changes so views observing the engine refresh.
-        // A fresh profile also clears the "calibration stale" warning.
         calibrationStore.$profile
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 self?.calibrationStale = false
+                self?.staleStreak = 0
                 self?.objectWillChange.send()
             }
             .store(in: &cancellables)
 
-        // Mirror engine prefs back into the settings store so they persist.
-        $speedMode
+        // A manual volume change re-anchors everything: the offset goes to
+        // zero and the baseline is re-measured. See VolumeController.
+        volumeController.$userAdjustmentCount
             .dropFirst()
-            .sink { [weak settings] v in settings?.speedMode = v }
-            .store(in: &cancellables)
-        $rangeMode
-            .dropFirst()
-            .sink { [weak settings] v in settings?.rangeMode = v }
-            .store(in: &cancellables)
-        $allowIncrease
-            .dropFirst()
-            .sink { [weak settings] v in settings?.allowIncrease = v }
-            .store(in: &cancellables)
-        $allowDecrease
-            .dropFirst()
-            .sink { [weak settings] v in settings?.allowDecrease = v }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.handleUserVolumeAdjustment()
+            }
             .store(in: &cancellables)
 
-        // Track active-state for auto-resume support.
-        $isActive
-            .dropFirst()
+        $speedMode.dropFirst()
+            .sink { [weak settings] v in settings?.speedMode = v }
+            .store(in: &cancellables)
+        $rangeMode.dropFirst()
+            .sink { [weak self, weak settings] v in
+                settings?.rangeMode = v
+                // Tightening the range must take effect immediately, not
+                // whenever the loop happens to drift back inside it.
+                self?.clampOffsetToRange(v.maxOffsetDB)
+            }
+            .store(in: &cancellables)
+        $allowIncrease.dropFirst()
+            .sink { [weak settings] v in settings?.allowIncrease = v }
+            .store(in: &cancellables)
+        $allowDecrease.dropFirst()
+            .sink { [weak settings] v in settings?.allowDecrease = v }
+            .store(in: &cancellables)
+        $isActive.dropFirst()
             .sink { [weak settings] v in settings?.wasActive = v }
             .store(in: &cancellables)
     }
@@ -172,50 +271,31 @@ final class EnvoEngine: ObservableObject {
 
     func start() {
         guard !isActive else { return }
+        lastStartFailure = nil
 
-        // Without mic access the loop would run on all-zero readings and
-        // still nudge the volume. Callers that can prompt (ContentView)
-        // resolve permission BEFORE calling start(); indirect callers
-        // (Siri intents, lock-screen play, auto-resume) must no-op.
-        guard audioManager.permissionGranted else { return }
+        guard audioManager.permissionGranted else {
+            lastStartFailure = "Microphone access is required."
+            return
+        }
+        guard !CalibrationManager.isCalibrating else {
+            lastStartFailure = "Calibration is running."
+            return
+        }
 
-        runGeneration &+= 1
-        let myGeneration = runGeneration
+        // Acquiring the session is what makes ENVO's presence audible to the
+        // rest of the system, so it happens here — on an explicit start —
+        // and never at launch.
+        guard AudioSessionController.shared.acquire(.engine) else {
+            lastStartFailure = "Could not start the audio session."
+            return
+        }
 
         BackgroundAudioHandler.shared.enableBackgroundAudio()
         volumeController.captureBaseVolume()
         audioManager.startMonitoring()
+        registerRouteObserver()
 
-        ambientSamples.removeAll()
-        recentMicLevels.removeAll()
-        spikeFilter.reset()
-        lastGapAmbient = nil
-        lastGapTime = .distantPast
-        currentOffset = 0.0
-        lastAppliedOffset = 0.0
-        baselineAmbient = 0.0
-        hasBaseline = false
-
-        var warmupSamples: [Float] = []
-        let warmupCount = 5
-        for step in 1...warmupCount {
-            let delay = Double(step) * 0.5
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self = self else { return }
-                guard self.runGeneration == myGeneration, self.isActive else { return }
-
-                let raw = self.audioManager.normalizedLevel
-                let vol = self.volumeController.currentVolume
-                let ambient = self.estimateAmbientNoise(rawMicLevel: raw, atVolume: vol)
-                warmupSamples.append(ambient)
-
-                if step == warmupCount {
-                    let avg = warmupSamples.reduce(0, +) / Float(warmupSamples.count)
-                    self.baselineAmbient = avg
-                    self.hasBaseline = true
-                }
-            }
-        }
+        resetControlState()
 
         engineTimer = Timer.scheduledTimer(withTimeInterval: sampleInterval, repeats: true) { [weak self] _ in
             self?.tick()
@@ -225,221 +305,328 @@ final class EnvoEngine: ObservableObject {
         }
 
         isActive = true
+        Log.engine.info("ENVO started. Taper span \(self.activeTaper.spanDB, format: .fixed(precision: 1)) dB, calibrated=\(self.isCalibrated).")
+    }
+
+    deinit {
+        removeRouteObserver()
     }
 
     func stop() {
-        runGeneration &+= 1
-
         engineTimer?.invalidate()
         engineTimer = nil
+        removeRouteObserver()
         audioManager.stopMonitoring()
-        ambientSamples.removeAll()
-        recentMicLevels.removeAll()
-        hasBaseline = false
-        baselineAmbient = 0.0
 
         volumeController.clearOffset()
         BackgroundAudioHandler.shared.disableBackgroundAudio()
+        AudioSessionController.shared.release(.engine)
 
+        resetControlState()
         isActive = false
-        currentOffset = 0.0
-        lastAppliedOffset = 0.0
         levelHistory = []
-        estimatedAmbient = 0.0
-        gapDetected = false
+        estimatedAmbientDB = nil
         calibrationStale = false
     }
+
+    private func resetControlState() {
+        ambientSamplesDB.removeAll()
+        recentRawDB.removeAll()
+        ambientTracker.reset()
+        spikeFilter.reset()
+        warmupTicks = 0
+        baselineAmbientDB = 0
+        hasBaseline = false
+        currentOffsetDB = 0
+        currentSliderOffset = 0
+        appliedSliderOffset = 0
+        staleStreak = 0
+        deadMicTicks = 0
+    }
+
+    /// The user moved the volume by hand. Their new position is the new
+    /// definition of "correct", so the adjustment goes to zero and the room
+    /// baseline is measured again from here.
+    private func handleUserVolumeAdjustment() {
+        guard isActive else { return }
+        reanchor(reason: "user adjusted volume")
+    }
+
+    /// The output route changed — headphones in or out, a Bluetooth speaker
+    /// connecting, AirPlay engaging.
+    ///
+    /// This invalidates almost everything the loop is holding, because the
+    /// *acoustic path itself* changed:
+    ///
+    ///   * The baseline was measured with the old path's playback bleeding
+    ///     into the microphone. Switch from the built-in speaker to
+    ///     headphones and that bleed vanishes, so the noise floor drops for a
+    ///     reason that has nothing to do with the room — and ENVO would read
+    ///     it as "it got quieter" and turn the volume DOWN. Unplugging does
+    ///     the reverse and turns it UP.
+    ///   * Each route remembers its own system volume, so the baseline volume
+    ///     is wrong too.
+    ///   * A measured taper describes the route it was measured on;
+    ///     `applicableTaper` falls back to the default on any other route.
+    ///
+    /// Deliberately does NOT write the slider on the way out: the old offset
+    /// is meaningless on the new path, and restoring it would fight the volume
+    /// iOS has just selected for that route.
+    private func handleRouteChange() {
+        guard isActive else { return }
+        volumeController.captureBaseVolume()
+        reanchor(reason: "output route changed")
+    }
+
+    /// Drop the adjustment and re-measure the room from here.
+    private func reanchor(reason: String) {
+        currentOffsetDB = 0
+        currentSliderOffset = 0
+        appliedSliderOffset = 0
+        hasBaseline = false
+        warmupTicks = 0
+        ambientTracker.reset()
+        spikeFilter.reset()
+        recentRawDB.removeAll()
+        Log.engine.info("Re-anchoring (\(reason, privacy: .public)): adjustment zeroed, baseline re-measuring.")
+    }
+
+    private func registerRouteObserver() {
+        guard routeChangeToken == nil else { return }
+        routeChangeToken = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self, self.isActive,
+                  let info = notification.userInfo,
+                  let raw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  let reason = AVAudioSession.RouteChangeReason(rawValue: raw) else { return }
+            switch reason {
+            case .newDeviceAvailable, .oldDeviceUnavailable, .override:
+                self.handleRouteChange()
+            default:
+                // .categoryChange fires when we configure our own session, and
+                // .routeConfigurationChange is often cosmetic. Neither means
+                // the acoustic path moved.
+                break
+            }
+        }
+    }
+
+    private func removeRouteObserver() {
+        if let token = routeChangeToken {
+            NotificationCenter.default.removeObserver(token)
+            routeChangeToken = nil
+        }
+    }
+
+    /// Bring an existing offset inside a newly-narrowed range immediately.
+    private func clampOffsetToRange(_ rangeDB: Float) {
+        guard isActive else { return }
+        let limit = effectiveRangeDB(rangeDB)
+        guard abs(currentOffsetDB) > limit else { return }
+        currentOffsetDB = AcousticMath.clamp(currentOffsetDB, -limit, limit)
+        applyCurrentOffset()
+    }
+
+    /// The range setting is honoured as chosen. Uncalibrated, the *accuracy*
+    /// of the dB is limited by the assumed taper — which errs toward moving
+    /// the slider too little — so there is no need to also narrow the range.
+    private func effectiveRangeDB(_ requested: Float) -> Float { requested }
 
     // MARK: - Engine Loop
 
     private func tick() {
         guard isActive else { return }
 
-        let rawMicLevel = audioManager.normalizedLevel
-        let currentVol = volumeController.currentVolume
+        // Watchdog. `isRunning` alone is not enough: the engine can report
+        // running while its tap has stopped delivering buffers, in which case
+        // `levelDB` freezes at its last value and steering on it would be
+        // steering on a stale number. Hold the offset and try to revive.
+        guard audioManager.isReceivingAudio() else {
+            deadMicTicks += 1
+            if deadMicTicks == 1 || deadMicTicks % 10 == 0 {
+                Log.audio.error("Mic not delivering audio (\(self.deadMicTicks) ticks); holding offset and rebuilding.")
+            }
+            audioManager.stopMonitoring()
+            audioManager.startMonitoring()
+            return
+        }
+        deadMicTicks = 0
 
-        checkForGap(rawMicLevel: rawMicLevel, currentVol: currentVol)
+        let rawDB = audioManager.levelDB
 
-        // A1 Lombard mitigation + A2 spike rejection live inside
-        // estimateAmbientNoise so calibrated/uncalibrated paths share them.
-        let ambient = estimateAmbientNoise(rawMicLevel: rawMicLevel, atVolume: currentVol)
-        estimatedAmbient = ambient
+        checkCalibrationDrift(rawDB: rawDB)
 
-        ambientSamples.append(ambient)
-        if ambientSamples.count > maxSampleCount {
-            ambientSamples.removeFirst(ambientSamples.count - maxSampleCount)
+        // A2: blunt door slams and claps before they reach the floor estimate.
+        // The voice-band share is stored alongside the level it was measured
+        // with, so the Lombard damper can later look at the spectral character
+        // of the readings that actually defined the floor rather than of
+        // whatever happens to be arriving on this tick.
+        let despikedDB = spikeFilter.ingest(rawDB)
+        ambientTracker.ingest(despikedDB, voiceShare: audioManager.voiceBandShare)
+
+        let windowSamples = max(warmupCount, Int(speedMode.windowSeconds / sampleInterval))
+        guard let floorDB = ambientTracker.floorDB(overLast: windowSamples) else {
+            // Not enough history yet. Genuinely nothing to say.
+            return
         }
 
-        levelHistory = Array(ambientSamples.suffix(60))
+        var ambientDB = floorDB
+        if hasBaseline,
+           let floorVoiceShare = ambientTracker.voiceShareAtFloor(overLast: windowSamples) {
+            ambientDB = lombardDamper.damp(ambientDB: floorDB,
+                                           voiceShare: floorVoiceShare,
+                                           baselineDB: baselineAmbientDB)
+        }
+        estimatedAmbientDB = ambientDB
 
-        guard hasBaseline else { return }
+        ambientSamplesDB.append(ambientDB)
+        if ambientSamplesDB.count > maxSampleCount {
+            ambientSamplesDB.removeFirst(ambientSamplesDB.count - maxSampleCount)
+        }
+        levelHistory = ambientSamplesDB.suffix(60).map(normalizedForDisplay)
 
-        let windowSamples = max(3, Int(speedMode.windowSeconds / sampleInterval))
-        let relevantSamples = Array(ambientSamples.suffix(windowSamples))
-        guard relevantSamples.count >= 3 else { return }
+        // Baseline: the room as it was when START was pressed.
+        guard hasBaseline else {
+            warmupTicks += 1
+            if warmupTicks >= warmupCount {
+                baselineAmbientDB = ambientDB
+                hasBaseline = true
+                Log.engine.info("Baseline anchored at \(self.baselineAmbientDB, format: .fixed(precision: 1)) dBFS.")
+            }
+            return
+        }
 
-        let windowAverage = relevantSamples.reduce(0, +) / Float(relevantSamples.count)
-        let noiseDelta = windowAverage - baselineAmbient
+        let noiseDeltaDB = ambientDB - baselineAmbientDB
 
-        // ── A3+A4 perceptual dB intent ──
-        // Treat the user's RANGE as a dB ceiling on the engine's "intent",
-        // then convert to a base-relative volume delta via VolumeMath so
-        // the same intent produces the same perceived dB change at any
-        // base volume.
-        let intentScale: Float = isCalibrated ? 2.0 : 1.2
-        let cappedRangeDB = isCalibrated
-            ? rangeMode.maxOffsetDB
-            : min(rangeMode.maxOffsetDB, 6.0)
-        var intendedDB = noiseDelta * intentScale * cappedRangeDB
-        intendedDB = clamp(intendedDB, -cappedRangeDB, cappedRangeDB)
-
-        // Direction filter in dB space (same semantics as before).
-        if !allowIncrease && intendedDB > 0 { intendedDB = 0 }
-        if !allowDecrease && intendedDB < 0 { intendedDB = 0 }
-
-        let baseVol = volumeController.baseVolume
-        let intendedOffset = VolumeMath.volumeDelta(
-            forDB: intendedDB,
-            atBase: baseVol,
-            ceiling: safetyCeiling   // A6 safety cap is enforced inside the math.
+        // ── Control law ──
+        currentOffsetDB = controlLaw.nextOffsetDB(
+            currentOffsetDB: currentOffsetDB,
+            noiseDeltaDB: noiseDeltaDB,
+            rangeDB: effectiveRangeDB(rangeMode.maxOffsetDB),
+            allowIncrease: allowIncrease,
+            allowDecrease: allowDecrease,
+            dt: Float(sampleInterval)
         )
 
-        // Smooth offset over time.
-        let smoothing = isCalibrated ? calibratedSmoothing : uncalibratedSmoothing
-        var smoothedOffset = smoothing * currentOffset + (1.0 - smoothing) * intendedOffset
-
-        // Zero-hysteresis (carryover from prior fix).
-        if abs(smoothedOffset) < zeroHysteresis {
-            smoothedOffset = 0.0
-        }
-
-        // A5 rate limiter on the applied offset.
-        let maxStep = maxOffsetRatePerSecond * Float(sampleInterval)
-        smoothedOffset = clamp(smoothedOffset,
-                               currentOffset - maxStep,
-                               currentOffset + maxStep)
-
-        // A6 safety ceiling double-check on the projected target.
-        let projected = baseVol + smoothedOffset
-        if projected > safetyCeiling {
-            smoothedOffset = safetyCeiling - baseVol
-        }
-
-        currentOffset = smoothedOffset
-
-        if abs(smoothedOffset - lastAppliedOffset) >= offsetChangeThreshold {
-            lastAppliedOffset = smoothedOffset
-            volumeController.applyOffset(smoothedOffset)
-        }
+        applyCurrentOffset()
     }
 
-    // MARK: - Ambient Noise Estimation
+    /// The loop's parameters.
+    var controlLaw: ControlLaw {
+        ControlLaw(
+            gain: compensationGain,
+            smoothing: offsetSmoothing,
+            zeroHysteresisDB: zeroHysteresisDB,
+            maxRateDBPerSecond: maxRateDBPerSecond
+        )
+    }
 
-    private func estimateAmbientNoise(rawMicLevel: Float, atVolume volume: Float) -> Float {
-        // A2: clip brief spikes (door slam, clap) before they reach
-        // the long-window average.
-        let despiked = spikeFilter.ingest(rawMicLevel)
+    /// Convert the dB intent into slider travel and hand it to the hardware.
+    /// The single place where dB becomes slider movement.
+    private func applyCurrentOffset() {
+        let baseVol = volumeController.baseVolume
+        let rangeDB = effectiveRangeDB(rangeMode.maxOffsetDB)
 
-        let baseEstimate: Float
-        if let profile = calibrationStore.profile {
-            var estimated = profile.estimateAmbient(rawMicLevel: despiked, atVolume: volume)
-            if let gapAmbient = lastGapAmbient,
-               Date().timeIntervalSince(lastGapTime) < gapAmbientTTL {
-                estimated = 0.3 * estimated + 0.7 * gapAmbient
+        let sliderOffset = activeTaper.volumeDelta(
+            forDB: currentOffsetDB,
+            atBase: baseVol,
+            rangeDB: rangeDB,
+            ceiling: safetyCeiling
+        )
+        currentSliderOffset = sliderOffset
+
+        guard abs(sliderOffset - appliedSliderOffset) >= sliderChangeThreshold else { return }
+        appliedSliderOffset = sliderOffset
+        volumeController.applyOffset(sliderOffset)
+    }
+
+    // MARK: - Calibration Staleness
+
+    /// Watches for stretches where the microphone hears nothing beyond what we
+    /// already believe the room to be — a pause between tracks, or silence
+    /// from the playing app.
+    ///
+    /// Such a stretch gives a reading of the room with no playback mixed into
+    /// it, which is the cleanest possible comparison against the silence floor
+    /// recorded at calibration time. A persistent disagreement means the room
+    /// is not the room that was calibrated, and the user is prompted to
+    /// recalibrate.
+    ///
+    /// This used to be the sole source of ambient readings, back when the
+    /// estimate came from subtracting the calibrated speaker level, and it was
+    /// surfaced to the user as a GAP badge. `AmbientTracker` now reads the room
+    /// floor continuously without needing playback to stop, so the badge was
+    /// removed and this is the only remaining consumer.
+    private func checkCalibrationDrift(rawDB: Float) {
+        guard let profile = calibrationStore.profile, profile.isUsable else { return }
+
+        recentRawDB.append(rawDB)
+        if recentRawDB.count > gapWindowSize {
+            recentRawDB.removeFirst(recentRawDB.count - gapWindowSize)
+        }
+        guard recentRawDB.count >= gapWindowSize else { return }
+
+        // Compare against whichever is higher: the calibrated floor, or what
+        // we currently believe the room to be. Otherwise a room that has got
+        // louder since calibration never registers a quiet stretch at all.
+        let reference = max(profile.silenceFloorDB,
+                            hasBaseline ? baselineAmbientDB : profile.silenceFloorDB)
+
+        // The MAXIMUM over the window, so a single loud instant anywhere in it
+        // disqualifies the stretch. A mean would let a brief pause inside busy
+        // playback masquerade as silence.
+        let recentMax = recentRawDB.max() ?? rawDB
+        guard recentMax <= reference + gapMarginDB else { return }
+
+        updateStaleness(observedFloorDB: AcousticMath.meanDB(recentRawDB),
+                        profile: profile)
+    }
+
+    /// Flag the calibration as stale only after several consecutive clean
+    /// readings disagree with it, so a single odd measurement cannot make the
+    /// button label flicker between CALIBRATED and RECAL?.
+    private func updateStaleness(observedFloorDB: Float, profile: CalibrationProfile) {
+        let drift = abs(observedFloorDB - profile.silenceFloorDB)
+        if drift > staleThresholdDB {
+            staleStreak += 1
+            if staleStreak >= staleConfirmations, !calibrationStale {
+                calibrationStale = true
             }
-            baseEstimate = max(estimated, 0.0)
         } else {
-            baseEstimate = despiked
-        }
-
-        // A1: anti-Lombard. When the mic is dominated by speech, discount
-        // the ambient estimate so people raising their voice doesn't get
-        // misread as "the room is louder, raise volume." Smoothly ramps
-        // in above 45% voice-band share, full effect by ~85%.
-        //
-        // Voice-band share is measured on the RAW signal, which includes
-        // our own playback — and music is voice-band heavy. When a
-        // calibration profile exists we know how much of the raw level is
-        // the device's own output, so we scale the damping by the ambient
-        // fraction: music-dominated signal → voice share is mostly music,
-        // damping fades out; speech-dominated signal → damping applies.
-        // Uncalibrated, full damping is kept — there it also serves as a
-        // brake on the playback feedback loop.
-        let voiceShare = audioManager.voiceBandShare
-        if voiceShare > 0.45 {
-            var speechWeight: Float = 1.0
-            if let profile = calibrationStore.profile {
-                let device = max(profile.expectedMicLevel(atVolume: volume) - profile.silenceFloor, 0.0)
-                let ambientFraction = (despiked - device) / max(despiked, 0.001)
-                speechWeight = clamp(ambientFraction, 0.0, 1.0)
-            }
-            let t = clamp((voiceShare - 0.45) / 0.4, 0.0, 1.0)
-            let dampen: Float = 0.8 * t * speechWeight
-            let damped = baseEstimate * (1.0 - dampen)
-            // Damping may only remove UPWARD pressure. Floored at the
-            // baseline so a voice-heavy signal can never read as "quieter
-            // than baseline" and drag the volume down.
-            let floor = hasBaseline ? min(baseEstimate, baselineAmbient) : 0.0
-            return max(damped, floor)
-        }
-        return baseEstimate
-    }
-
-    // MARK: - Gap Detection
-
-    private func checkForGap(rawMicLevel: Float, currentVol: Float) {
-        guard let profile = calibrationStore.profile else { return }
-
-        recentMicLevels.append(rawMicLevel)
-        if recentMicLevels.count > gapWindowSize {
-            recentMicLevels.removeFirst()
-        }
-
-        guard recentMicLevels.count >= gapWindowSize else { return }
-
-        let recentMax = recentMicLevels.max() ?? 0
-        let threshold = profile.silenceFloor * gapThreshold
-
-        if recentMax <= threshold && threshold > 0 {
-            let rawGap = recentMicLevels.reduce(0, +) / Float(recentMicLevels.count)
-            let ambientGap = profile.estimateAmbient(rawMicLevel: rawGap, atVolume: currentVol)
-            lastGapAmbient = ambientGap
-            lastGapTime = Date()
-
-            let adaptRate: Float = 0.1
-            baselineAmbient = (1.0 - adaptRate) * baselineAmbient + adaptRate * ambientGap
-
-            // B8 validity check: compare live floor against calibrated floor.
-            // Flag as stale when the live floor has drifted by > 40% of the
-            // calibrated value (in either direction).
-            let referenceFloor = max(profile.silenceFloor, 0.001)
-            let drift = abs(rawGap - profile.silenceFloor) / referenceFloor
-            calibrationStale = drift > 0.4
-
-            gapDetected = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.gapDetected = false
-            }
+            staleStreak = 0
+            if calibrationStale { calibrationStale = false }
         }
     }
 
     // MARK: - Display Accessors
 
+    private func normalizedForDisplay(_ dbfs: Float) -> Float {
+        let lo = AudioManager.displayFloorDB
+        let hi = AudioManager.displayCeilingDB
+        return AcousticMath.clamp((dbfs - lo) / (hi - lo), 0, 1)
+    }
+
+    /// Normalized level for the visualizer.
+    var visualizerLevel: Float {
+        guard let ambient = estimatedAmbientDB else { return 0 }
+        return normalizedForDisplay(ambient)
+    }
+
+    /// Adjustment in dB, formatted for the readout — with a sign, and always
+    /// alongside a "dB" unit in the UI.
     var displayOffset: String {
-        let pct = Int((currentOffset * 100).rounded())
-        if pct > 0 { return "+\(pct)" }
-        if pct < 0 { return "\(pct)" }
-        return "0"
+        let rounded = (currentOffsetDB * 10).rounded() / 10
+        if rounded > 0.05 { return String(format: "+%.1f", rounded) }
+        if rounded < -0.05 { return String(format: "%.1f", rounded) }
+        return "0.0"
     }
 
-    var displayAmbient: Int {
-        let mapped = 30.0 + Float(estimatedAmbient) * 80.0
-        return Int(mapped)
-    }
-
-    // MARK: - Helpers
-
-    private func clamp(_ value: Float, _ lo: Float, _ hi: Float) -> Float {
-        return min(max(value, lo), hi)
+    /// Approximate room level in dB SPL, or nil when not measurable.
+    var displayAmbient: Int? {
+        guard let ambient = estimatedAmbientDB else { return nil }
+        return AudioManager.approximateSPL(fromDBFS: ambient)
     }
 }

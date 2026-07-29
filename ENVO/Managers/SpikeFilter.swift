@@ -16,10 +16,18 @@ struct SpikeFilter {
     private var window: [Float] = []
     private let windowSize: Int
     private let spikeRatio: Float
+    private let minimumMargin: Float
 
-    init(windowSize: Int = 12, spikeRatio: Float = 2.5) {
+    /// - Parameters:
+    ///   - minimumMargin: floor on the spread term, in the same unit as the
+    ///     samples. The engine now feeds this filter **decibels**, where the
+    ///     old hard-coded 0.02 (tuned for a normalized 0…1 level) was three
+    ///     orders of magnitude too small to have any effect — every spike
+    ///     passed straight through.
+    init(windowSize: Int = 12, spikeRatio: Float = 2.5, minimumMargin: Float = 1.0) {
         self.windowSize = max(3, windowSize)
         self.spikeRatio = max(1.1, spikeRatio)
+        self.minimumMargin = max(0.0001, minimumMargin)
     }
 
     /// Push a sample, return the spike-filtered value.
@@ -36,7 +44,7 @@ struct SpikeFilter {
         let q1 = sorted[Int(Float(sorted.count) * 0.25)]
         let iqr = q3 - q1
 
-        let threshold = median + max(0.02, iqr * 1.5) * spikeRatio
+        let threshold = median + max(minimumMargin, iqr * 1.5) * spikeRatio
         if sample > threshold {
             // Winsorize back to the threshold to absorb the spike but keep
             // signal direction. Also replace the just-pushed sample so the

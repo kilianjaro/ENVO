@@ -11,8 +11,15 @@ final class CalibrationStore: ObservableObject {
 
     @Published private(set) var profile: CalibrationProfile?
 
-    /// True when a usable profile is loaded.
-    var isCalibrated: Bool { profile != nil }
+    /// True when a profile is loaded AND it passes its own validity check.
+    ///
+    /// This is deliberately stricter than "a profile exists". A profile that
+    /// recorded no measurable speaker output — the signature of the silent
+    /// sweep / deaf mic bug — would otherwise flip the engine into calibrated
+    /// mode, where every ambient estimate is derived from a subtraction that
+    /// cannot work. Better to run uncalibrated than to run on a profile that
+    /// is confidently wrong.
+    var isCalibrated: Bool { profile?.isUsable == true }
 
     private let storageKey = "envo_calibration_profile"
 
@@ -39,9 +46,23 @@ final class CalibrationStore: ObservableObject {
         self.profile = nil
     }
 
+    /// Loads and validates. A stored profile from an older schema is deleted
+    /// rather than migrated: v1 stored normalized 0…1 levels, and there is no
+    /// sound way to reinterpret those as the dBFS values v2 expects. The user
+    /// is asked to recalibrate, which now takes ~35 seconds and actually works.
     private static func loadFromDisk(key: String) -> CalibrationProfile? {
-        guard let data = UserDefaults.standard.data(forKey: key),
-              let profile = try? JSONDecoder().decode(CalibrationProfile.self, from: data) else {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+
+        guard let profile = try? JSONDecoder().decode(CalibrationProfile.self, from: data),
+              profile.version == CalibrationProfile.currentVersion else {
+            Log.general.info("Discarding calibration profile from an incompatible schema; recalibration required.")
+            UserDefaults.standard.removeObject(forKey: key)
+            return nil
+        }
+
+        guard profile.isUsable else {
+            Log.general.info("Discarding calibration profile that recorded no measurable speaker output.")
+            UserDefaults.standard.removeObject(forKey: key)
             return nil
         }
         return profile

@@ -1,11 +1,15 @@
 import Foundation
 import AVFoundation
 
-/// Keeps the app alive in the background by maintaining an active audio session.
+/// Keeps the app alive in the background with a silent looping player,
+/// paired with the `audio` UIBackgroundMode. Necessary because ENVO must
+/// keep monitoring ambient noise while the user is in Spotify/Music/YouTube.
 ///
-/// Uses a silent audio loop combined with the `audio` UIBackgroundMode.
-/// This is necessary because ENVO must continuously monitor ambient noise
-/// and adjust volume even when the user switches to Spotify/Music/YouTube.
+/// This type deliberately does NOT configure or activate the audio session
+/// any more — `AudioSessionController` owns that, so session ownership is
+/// reference-counted and nothing activates a record session before the user
+/// has actually started ENVO. See AudioSessionController for why that
+/// mattered (opening the app used to quieten all playback).
 final class BackgroundAudioHandler {
 
     static let shared = BackgroundAudioHandler()
@@ -17,28 +21,18 @@ final class BackgroundAudioHandler {
 
     private init() {}
 
+    /// Call only while `AudioSessionController` already holds an active
+    /// session — the silent player needs one to keep the process alive.
     func enableBackgroundAudio() {
         guard silentPlayer == nil else { return }
 
-        do {
-            let session = AVAudioSession.sharedInstance()
-            // A2DP (not HFP): Bluetooth headphones keep hi-fi stereo output
-            // while ambient noise is sensed by the iPhone's built-in mic.
-            try session.setCategory(
-                .playAndRecord,
-                mode: .measurement,
-                options: [.defaultToSpeaker, .allowBluetoothA2DP, .mixWithOthers]
-            )
-            try session.setActive(true)
-
-            if let player = createSilentPlayer() {
-                player.numberOfLoops = -1
-                player.volume = 0.0
-                player.play()
-                silentPlayer = player
-            }
-        } catch {
-            Log.session.error("BackgroundAudioHandler error: \(error.localizedDescription, privacy: .public)")
+        if let player = createSilentPlayer() {
+            player.numberOfLoops = -1
+            player.volume = 0.0
+            player.play()
+            silentPlayer = player
+        } else {
+            Log.session.error("Could not create the background keep-alive player.")
         }
 
         // Replace any prior route observer (start/stop cycles must not leak).
@@ -68,7 +62,13 @@ final class BackgroundAudioHandler {
         ) { [weak self] _ in
             self?.silentPlayer?.stop()
             self?.silentPlayer = nil
-            self?.enableBackgroundAudio()
+            // AudioSessionController observes the same notification and
+            // re-applies the category; give it a beat to win the race before
+            // we ask for a player that needs an active session.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard AudioSessionController.shared.isSessionActive else { return }
+                self?.enableBackgroundAudio()
+            }
         }
 
         if let token = mediaServicesLostToken {
@@ -100,15 +100,8 @@ final class BackgroundAudioHandler {
             NotificationCenter.default.removeObserver(token)
             mediaServicesLostToken = nil
         }
-
-        // Politely yield the session so other apps' playback can resume.
-        do {
-            try AVAudioSession.sharedInstance().setActive(
-                false, options: .notifyOthersOnDeactivation
-            )
-        } catch {
-            // Non-fatal: another component may still hold the session.
-        }
+        // Session deactivation is AudioSessionController's job — calibration
+        // may still be holding it.
     }
 
     private func createSilentPlayer() -> AVAudioPlayer? {

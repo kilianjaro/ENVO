@@ -89,7 +89,11 @@ final class AppLifecycleCoordinator: ObservableObject {
         guard !hasBootstrapped else { return }
         hasBootstrapped = true
 
-        configureAudioSession()
+        // NOTE: the audio session is deliberately NOT configured or activated
+        // here. Doing so at launch is what made all playback go quiet the
+        // instant ENVO was opened — see AudioSessionController. The session is
+        // acquired by the engine on START and by calibration on run, and
+        // released when neither needs it.
         registerForInterruptions()
         audioManager.prepare()
 
@@ -120,26 +124,21 @@ final class AppLifecycleCoordinator: ObservableObject {
             // Returning from background: ensure VolumeController is set up
             // even if bootstrap fired before any scene was available.
             volumeController?.setup()
+
+            // iOS does not guarantee an interruption `.ended` delivery
+            // (e.g. the interrupting app never deactivates its session).
+            // If an interruption stopped the engine and no .ended arrived,
+            // resume when the user comes back. If the interruption is in
+            // fact still ongoing, the engine's mic watchdog keeps retrying
+            // and recovers once the session is free.
+            if wasActiveBeforeInterruption, let engine = engine, !engine.isActive {
+                wasActiveBeforeInterruption = false
+                engine.start()   // acquires the session itself
+            }
         case .background, .inactive:
             break
         @unknown default:
             break
-        }
-    }
-
-    private func configureAudioSession() {
-        do {
-            let session = AVAudioSession.sharedInstance()
-            // A2DP (not HFP): Bluetooth headphones keep hi-fi stereo output
-            // while ambient noise is sensed by the iPhone's built-in mic.
-            try session.setCategory(
-                .playAndRecord,
-                mode: .measurement,
-                options: [.defaultToSpeaker, .allowBluetoothA2DP, .mixWithOthers]
-            )
-            try session.setActive(true)
-        } catch {
-            Log.session.error("Audio session error: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -163,12 +162,17 @@ final class AppLifecycleCoordinator: ObservableObject {
                 if self.engine?.isActive == true {
                     self.wasActiveBeforeInterruption = true
                     self.engine?.stop()
+                    // stop() persists wasActive = false via the settings
+                    // sink, but the user never chose to stop — keep
+                    // auto-resume armed in case the app is terminated
+                    // before the interruption ends.
+                    self.settings?.wasActive = true
                 } else {
                     self.wasActiveBeforeInterruption = false
                 }
 
             case .ended:
-                self.configureAudioSession()
+                AudioSessionController.shared.reactivateIfNeeded()
                 if let optionsValue = info[AVAudioSessionInterruptionOptionKey] as? UInt {
                     let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
                     if options.contains(.shouldResume), self.wasActiveBeforeInterruption {
