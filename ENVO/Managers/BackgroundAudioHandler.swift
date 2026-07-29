@@ -105,25 +105,37 @@ final class BackgroundAudioHandler {
     }
 
     private func createSilentPlayer() -> AVAudioPlayer? {
-        // Minimal WAV: 44-byte header + 2 bytes silence.
-        var wav = Data()
+        // One full second of silence, not one sample.
+        //
+        // The previous version wrote a two-byte data chunk — a single 16-bit
+        // sample, 0.125 ms at 8 kHz — and looped it forever. That asks
+        // AVAudioPlayer to restart eight thousand times a second, which is
+        // neither what the loop counter is for nor something the framework
+        // gives any guarantee about; it burns CPU on the exact code path that
+        // exists to survive being backgrounded, and an implementation that
+        // coalesces or drops such loops stops keeping the process alive at all.
+        let sampleRate = 8000
+        let frameCount = sampleRate            // 1.0 s
+        let dataSize = frameCount * 2
+
+        var wav = Data(capacity: 44 + dataSize)
 
         wav.append(contentsOf: Array("RIFF".utf8))
-        wav.append(contentsOf: uint32LE(36 + 2))
+        wav.append(contentsOf: uint32LE(UInt32(36 + dataSize)))
         wav.append(contentsOf: Array("WAVE".utf8))
 
         wav.append(contentsOf: Array("fmt ".utf8))
         wav.append(contentsOf: uint32LE(16))
-        wav.append(contentsOf: uint16LE(1))
-        wav.append(contentsOf: uint16LE(1))
-        wav.append(contentsOf: uint32LE(8000))
-        wav.append(contentsOf: uint32LE(16000))
-        wav.append(contentsOf: uint16LE(2))
+        wav.append(contentsOf: uint16LE(1))                       // PCM
+        wav.append(contentsOf: uint16LE(1))                       // mono
+        wav.append(contentsOf: uint32LE(UInt32(sampleRate)))
+        wav.append(contentsOf: uint32LE(UInt32(sampleRate * 2)))  // byte rate
+        wav.append(contentsOf: uint16LE(2))                       // block align
         wav.append(contentsOf: uint16LE(16))
 
         wav.append(contentsOf: Array("data".utf8))
-        wav.append(contentsOf: uint32LE(2))
-        wav.append(contentsOf: [0x00, 0x00])
+        wav.append(contentsOf: uint32LE(UInt32(dataSize)))
+        wav.append(Data(repeating: 0, count: dataSize))
 
         return try? AVAudioPlayer(data: wav)
     }

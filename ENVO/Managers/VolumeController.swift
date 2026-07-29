@@ -33,11 +33,29 @@ final class VolumeController: ObservableObject {
     /// only correct response is to start again from zero.
     @Published private(set) var userAdjustmentCount: Int = 0
 
+    /// True while ENVO can actually move the output level.
+    ///
+    /// Some routes do not give the app a system volume to move at all. AirPlay
+    /// to a receiver, HDMI and many external DACs keep their own level and iOS
+    /// responds by removing the slider from `MPVolumeView` entirely — at which
+    /// point every write ENVO makes is a silent no-op while the UI cheerfully
+    /// reports an adjustment. A controller that cannot tell the user it is
+    /// powerless is worse than one that does nothing.
+    @Published private(set) var isVolumeControlAvailable: Bool = true
+
+    /// The step the hardware actually quantizes to, measured rather than
+    /// assumed. See `VolumeController.defaultVolumeStep`.
+    @Published private(set) var volumeStep: Float = VolumeController.defaultVolumeStep
+
     /// The offset the hardware actually settled on, as opposed to the one
     /// ENVO requested. These differ whenever the system quantizes the volume
-    /// to discrete steps. Diagnostic — nothing steers on it — but it is the
-    /// ground truth for "did that adjustment land at all".
-    @Published private(set) var achievedOffset: Float = 0
+    /// to discrete steps. This is the ground truth for "what did ENVO actually
+    /// do", and `SelfCouplingEstimator` needs exactly that: attributing a
+    /// contribution ENVO merely *asked* for would corrupt the estimate by up to
+    /// half a step every time.
+    var achievedOffset: Float {
+        AVAudioSession.sharedInstance().outputVolume - baseVolume
+    }
 
     /// Hard limit on how far ENVO may ever move the slider from the user's
     /// baseline, regardless of what the engine asks for. A last line of
@@ -72,18 +90,35 @@ final class VolumeController: ObservableObject {
     /// and the KVO round-trip on heavily-loaded devices.
     private let envoWindow: TimeInterval = 0.8
 
-    /// The granularity of the iOS system volume.
+    /// Starting assumption for the granularity of the iOS system volume.
     ///
-    /// **Measured on device**, not assumed: logging requested-vs-achieved for
-    /// every write produced only the values 0.50, 0.55 and 0.60, with errors
-    /// up to 0.0236 — round-to-nearest on a 0.05 grid. Twenty steps, not the
-    /// sixteen this file previously assumed.
+    /// Measured on one device and one route: logging requested-vs-achieved for
+    /// every write produced only the values 0.50, 0.55 and 0.60 — round-to-
+    /// nearest on a 0.05 grid, twenty steps.
     ///
-    /// The difference matters twice over: 1/16 is larger than a real step, so
-    /// the old echo threshold below could swallow a genuine user press; and a
-    /// single step is worth roughly 3 dB of actual loudness, which is the
-    /// entire ±3 dB range setting.
-    static let volumeStep: Float = 0.05
+    /// That is *not* universal. Headphone and Bluetooth routes commonly use
+    /// sixteen steps (0.0625), and hard-coding the wrong one has two concrete
+    /// consequences: the post-snap guard below (half a step) silently discards
+    /// writes that land between the assumed grid and the real one, and the echo
+    /// threshold can drift close enough to a real step to swallow a genuine
+    /// user press. So this is only the starting value — `observeStepFrom`
+    /// narrows it to whatever the hardware is actually doing.
+    ///
+    /// A single step is worth roughly 3 dB of actual loudness, which is the
+    /// entire ±3 dB range setting, so getting it right matters.
+    static let defaultVolumeStep: Float = 0.05
+
+    /// Grids iOS is known to use. The probe snaps to the nearest of these
+    /// rather than believing an arbitrary measured difference, because two
+    /// user presses in quick succession can look like one large step.
+    private static let knownStepGrids: [Float] = [1.0 / 16.0, 0.05]
+
+    /// Smallest genuine inter-step difference seen so far this session.
+    private var smallestObservedDelta: Float = .greatestFiniteMagnitude
+
+    /// Consecutive ENVO writes that never showed up on the output.
+    private var failedWriteStreak = 0
+    private let failedWriteLimit = 3
 
     /// Proximity threshold for "matches what ENVO requested".
     ///
@@ -176,6 +211,7 @@ final class VolumeController: ObservableObject {
         for subview in vv.subviews {
             if let slider = subview as? UISlider {
                 self.volumeSlider = slider
+                refreshAvailability()
                 return
             }
         }
@@ -184,13 +220,78 @@ final class VolumeController: ObservableObject {
                 guard let self = self, let vv = vv else { return }
                 self.findSlider(in: vv, retries: retries - 1)
             }
+        } else {
+            // MPVolumeView never produced a slider. On routes that own their own
+            // level there is nothing to produce.
+            Log.volume.error("No system volume slider available on this route; ENVO cannot change the level.")
+            isVolumeControlAvailable = false
         }
+    }
+
+    // MARK: - Availability
+
+    /// Re-evaluate whether ENVO can move this route's level. Called on setup and
+    /// whenever the route changes.
+    func refreshAvailability() {
+        failedWriteStreak = 0
+
+        guard volumeSlider != nil else {
+            isVolumeControlAvailable = false
+            return
+        }
+
+        // AirPlay to a receiver, and anything behind it, keeps its own volume.
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let ownsItsOwnLevel = outputs.contains { output in
+            output.portType == .airPlay || output.portType == .HDMI
+        }
+        isVolumeControlAvailable = !ownsItsOwnLevel
+    }
+
+    // MARK: - Step probing
+
+    /// Learn the hardware's real volume quantum from the changes it reports.
+    ///
+    /// Only user-driven changes are used. ENVO's own writes are pre-snapped to
+    /// whatever grid is currently believed, so feeding them back in would just
+    /// confirm the existing guess.
+    private func observeStepFrom(_ delta: Float) {
+        let magnitude = abs(delta)
+        // Below 0.02 is float noise; above 0.15 is a Control Center drag or
+        // several presses, which says nothing about the quantum.
+        guard magnitude >= 0.02, magnitude <= 0.15 else { return }
+        guard magnitude < smallestObservedDelta else { return }
+        smallestObservedDelta = magnitude
+
+        // Snap to the nearest grid iOS is known to use rather than trusting the
+        // raw number: two quick presses look like one double-size step.
+        var best = VolumeController.knownStepGrids[0]
+        var bestError = Float.greatestFiniteMagnitude
+        for grid in VolumeController.knownStepGrids {
+            // A genuine observation is an integer multiple of the grid.
+            let multiples = (magnitude / grid).rounded()
+            guard multiples >= 1 else { continue }
+            let error = abs(magnitude - multiples * grid)
+            if error < bestError {
+                bestError = error
+                best = grid
+            }
+        }
+
+        guard bestError < 0.01, abs(best - volumeStep) > 0.0001 else { return }
+        Log.volume.info("System volume quantum measured as \(best, format: .fixed(precision: 4)) (was \(self.volumeStep, format: .fixed(precision: 4))).")
+        volumeStep = best
     }
 
     // MARK: - Volume Change Detection
 
     private func handleVolumeChange(_ newVolume: Float) {
+        let previousVolume = currentVolume
         currentVolume = newVolume
+
+        // Any change at all proves the route responds to volume, which is the
+        // strongest possible evidence that control is available.
+        failedWriteStreak = 0
 
         // Was this change made by ENVO?
         let timeSinceEnvoChange = Date().timeIntervalSince(lastEnvoChangeTime)
@@ -206,14 +307,12 @@ final class VolumeController: ObservableObject {
                 lastEnvoTarget = nil
                 consumedEnvoEcho = newVolume
 
-                // What the hardware ACTUALLY did, which is not necessarily
-                // what we asked for: iOS appears to quantize the system volume
-                // to sixteen steps, so a requested target lands on the nearest
-                // one. Everything upstream reasons about a continuous slider,
-                // so this is the only place the difference is visible — and
-                // without recording it, ENVO's model of its own effect drifts
-                // away from reality with no way to notice.
-                achievedOffset = newVolume - baseVolume
+                // What the hardware ACTUALLY did, which is not necessarily what
+                // we asked for: the system quantizes to discrete steps, so a
+                // requested target lands on the nearest one. Everything upstream
+                // reasons about a continuous slider, so this is the only place
+                // the difference is visible — and `achievedOffset` above is what
+                // the self-coupling estimator reads rather than the request.
                 let error = newVolume - target
                 if abs(error) > 0.002 {
                     Log.volume.info(
@@ -229,9 +328,13 @@ final class VolumeController: ObservableObject {
 
         if !wasEnvo {
             // USER changed the volume. This is the new baseline — always respect it.
+            // Their presses are also the only honest sample of the hardware's
+            // quantum, since ENVO's own writes are pre-snapped to the current
+            // guess and would only confirm it.
+            observeStepFrom(newVolume - previousVolume)
+
             baseVolume = newVolume
             appliedOffset = 0.0
-            achievedOffset = 0.0
             lastEnvoTarget = nil
             consumedEnvoEcho = nil
             // Tell the engine to drop its accumulated offset too, or it will
@@ -265,13 +368,13 @@ final class VolumeController: ObservableObject {
         // steps whenever the intent drifts across a boundary — a ~3 dB jump
         // caused by rounding, not by the room.
         guard abs(desired - currentSystemVol)
-                >= VolumeController.volumeStep * stepHysteresis else { return }
+                >= volumeStep * stepHysteresis else { return }
 
         // Pre-snap to the grid the hardware will round to anyway. This makes
         // the KVO echo an exact match rather than an approximate one, which is
         // what lets the echo threshold sit safely below one step.
         let target = snappedToStep(desired)
-        guard abs(target - currentSystemVol) >= VolumeController.volumeStep * 0.5 else { return }
+        guard abs(target - currentSystemVol) >= volumeStep * 0.5 else { return }
 
         // Apply it. Mark the timestamp BEFORE the slider write so the KVO
         // callback fires while we're still inside the envoWindow.
@@ -282,6 +385,31 @@ final class VolumeController: ObservableObject {
             self?.volumeSlider?.value = target
             self?.volumeSlider?.sendActions(for: .valueChanged)
             self?.currentVolume = target
+        }
+
+        verifyWriteLanded(target: target)
+    }
+
+    /// Check, shortly after a write, that the output actually moved.
+    ///
+    /// On a route that owns its own level the slider write succeeds silently and
+    /// changes nothing. Without this, ENVO reports adjustments it never made for
+    /// as long as the user stays on that route — and the readout is the only
+    /// thing they have to judge the app by.
+    private func verifyWriteLanded(target: Float) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard let self = self else { return }
+            let actual = AVAudioSession.sharedInstance().outputVolume
+            if abs(actual - target) <= self.volumeStep * 0.75 {
+                self.failedWriteStreak = 0
+                if !self.isVolumeControlAvailable { self.refreshAvailability() }
+                return
+            }
+            self.failedWriteStreak += 1
+            if self.failedWriteStreak >= self.failedWriteLimit, self.isVolumeControlAvailable {
+                Log.volume.error("Volume writes are not landing on this route; marking control unavailable.")
+                self.isVolumeControlAvailable = false
+            }
         }
     }
 
@@ -318,9 +446,9 @@ final class VolumeController: ObservableObject {
         baseVolume = vol
         currentVolume = vol
         appliedOffset = 0.0
-        achievedOffset = 0.0
         lastEnvoTarget = nil
         consumedEnvoEcho = nil
+        refreshAvailability()
     }
 
     /// Set volume immediately (used by calibration only).
@@ -351,7 +479,7 @@ final class VolumeController: ObservableObject {
 
     /// Round to the nearest achievable system-volume step.
     func snappedToStep(_ value: Float) -> Float {
-        let step = VolumeController.volumeStep
+        let step = volumeStep
         return clamp((value / step).rounded() * step)
     }
 

@@ -1,122 +1,64 @@
 import Foundation
 import MediaPlayer
 import Combine
-import UIKit
 
-/// Surfaces ENVO on the lock screen / Control Center via
-/// MPNowPlayingInfoCenter + MPRemoteCommandCenter.
+/// Keeps ENVO **out** of the system Now Playing surface.
 ///
-/// We aren't actually playing audio the user wants to hear — we're a
-/// background-audio "session holder." But publishing a Now Playing entry
-/// has two real benefits:
-///   1. The user can see "ENVO is running" without unlocking.
-///   2. The remote-command stop button gives them a one-tap exit.
+/// WHY THIS TYPE NO LONGER PUBLISHES ANYTHING
+/// ------------------------------------------
+/// ENVO used to populate `MPNowPlayingInfoCenter` with a title, a playback rate
+/// of 1.0 and a live-stream flag, and register play/pause/stop remote commands.
+/// The intention was benign — show that ENVO is running, and offer a one-tap
+/// exit from the lock screen.
 ///
-/// We never claim playback control of OTHER apps' audio. The Now Playing
-/// entry is purely informational about ENVO's own activity state.
+/// The effect was not. ENVO holds an active audio session and plays a silent
+/// keep-alive track, so as far as iOS is concerned it is a playing audio app;
+/// publishing Now Playing info makes it eligible to *become* the now-playing
+/// app. In the situation ENVO is built for — running in the background while
+/// Spotify, Music, Podcasts or YouTube plays — that meant the lock screen and
+/// Control Center stopped showing the user's track and showed "ENVO — adapting
+/// volume" instead, and the transport buttons stopped the engine rather than
+/// the music. A utility that runs alongside the user's media player must not
+/// take the media player's controls away from them.
+///
+/// So ENVO now claims nothing. Starting and stopping happen in the app, through
+/// the Action Button, or via Siri and Shortcuts (`EnvoIntents`), all of which
+/// work from the lock screen already and none of which cost the user their
+/// transport controls.
+///
+/// This type remains as the one place that guarantees the tile stays clear:
+/// `MPNowPlayingInfoCenter` is process-global, and an entry left behind by an
+/// earlier build or an earlier launch persists until something clears it.
 final class NowPlayingController: ObservableObject {
 
-    private weak var engine: EnvoEngine?
-    private weak var volumeController: VolumeController?
-
     private var cancellables = Set<AnyCancellable>()
-    private var registered = false
 
+    /// Clear anything ENVO may have published, and make sure the remote command
+    /// centre is not holding handlers that would let ENVO win the tile.
     func attach(engine: EnvoEngine, volumeController: VolumeController) {
-        self.engine = engine
-        self.volumeController = volumeController
+        relinquish()
 
-        registerRemoteCommands()
-
-        // Sync the lock-screen tile whenever ENVO state changes.
+        // Also clear on every stop, in case a future change ever publishes
+        // something while running.
         engine.$isActive
             .removeDuplicates()
-            .sink { [weak self] active in
-                self?.updateNowPlaying(isActive: active)
-            }
-            .store(in: &cancellables)
-
-        engine.$currentOffsetDB
-            .throttle(for: .seconds(0.5), scheduler: RunLoop.main, latest: true)
-            .sink { [weak self] _ in
-                self?.refresh()
-            }
-            .store(in: &cancellables)
-
-        engine.$estimatedAmbientDB
-            .throttle(for: .seconds(0.5), scheduler: RunLoop.main, latest: true)
-            .sink { [weak self] _ in
-                self?.refresh()
-            }
+            .filter { !$0 }
+            .sink { [weak self] _ in self?.relinquish() }
             .store(in: &cancellables)
     }
 
-    // MARK: - Remote commands
-
-    private func registerRemoteCommands() {
-        guard !registered else { return }
-        registered = true
+    private func relinquish() {
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
 
         let cc = MPRemoteCommandCenter.shared()
-
-        cc.stopCommand.isEnabled = true
-        cc.stopCommand.addTarget { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.engine?.stop()
-            }
-            return .success
-        }
-
-        cc.pauseCommand.isEnabled = true
-        cc.pauseCommand.addTarget { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.engine?.stop()
-            }
-            return .success
-        }
-
-        // Resume from lock screen mirrors start. Useful but optional —
-        // if mic permission isn't granted, the engine silently no-ops.
-        cc.playCommand.isEnabled = true
-        cc.playCommand.addTarget { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.engine?.start()
-            }
-            return .success
-        }
-
-        // Disable controls we don't model (skip / scrub / etc.).
+        cc.playCommand.isEnabled = false
+        cc.pauseCommand.isEnabled = false
+        cc.stopCommand.isEnabled = false
+        cc.togglePlayPauseCommand.isEnabled = false
         cc.nextTrackCommand.isEnabled = false
         cc.previousTrackCommand.isEnabled = false
         cc.changePlaybackPositionCommand.isEnabled = false
         cc.seekForwardCommand.isEnabled = false
         cc.seekBackwardCommand.isEnabled = false
-    }
-
-    // MARK: - Now Playing tile
-
-    private func updateNowPlaying(isActive: Bool) {
-        if isActive {
-            refresh()
-        } else {
-            // Wipe the tile when stopped so the lock screen doesn't lie.
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
-        }
-    }
-
-    private func refresh() {
-        guard let engine = engine, engine.isActive else { return }
-
-        let center = MPNowPlayingInfoCenter.default()
-        let ambient = engine.displayAmbient.map { "ambient \($0) dB" } ?? "ambient —"
-        let offset = engine.displayOffset
-        let subtitle = offset == "0.0" ? ambient : "\(offset) dB · \(ambient)"
-
-        var info: [String: Any] = [:]
-        info[MPMediaItemPropertyTitle] = "ENVO — adapting volume"
-        info[MPMediaItemPropertyArtist] = subtitle
-        info[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
-        info[MPNowPlayingInfoPropertyIsLiveStream] = true
-        center.nowPlayingInfo = info
     }
 }

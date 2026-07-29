@@ -47,6 +47,13 @@ struct ContentView: View {
 
                     // Status row: ACTIVE/STANDBY + CALIBRATE + GAP
                     statusRow
+
+                    // Calm, specific explanation whenever ENVO is running but
+                    // deliberately not adapting. Occupies no space otherwise.
+                    if engine.isActive, advisoryNotice != nil {
+                        Spacer().frame(maxHeight: 12)
+                        advisoryView
+                    }
                     Spacer()
 
                     // Visualization. Once calibrated AND active, show the
@@ -336,10 +343,71 @@ struct ContentView: View {
     }
 
     private var offsetColor: Color {
-        let offsetDB = engine.currentOffsetDB
+        // Matches `engine.displayOffset`, which reports what the hardware
+        // delivered rather than what the control law intended.
+        let offsetDB = engine.deliveredOffsetDB
         if offsetDB > 0.05 { return .white }
         if offsetDB < -0.05 { return .gray }
         return .white.opacity(0.5)
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MARK: - Advisory Notice
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// The one thing, if any, currently stopping ENVO from adapting.
+    ///
+    /// All four of these states used to be invisible: ENVO went on reporting an
+    /// adjustment while the microphone was in a pocket, while the input was
+    /// clipping, while nothing was playing, or while the route quietly discarded
+    /// every volume write. A controller that cannot say "I am not able to do
+    /// this right now" leaves the user to conclude the app is broken.
+    ///
+    /// Ordered by how much it matters that the user knows.
+    private var advisoryNotice: (title: String, detail: String)? {
+        if !volumeController.isVolumeControlAvailable {
+            return ("OUTPUT NOT CONTROLLABLE",
+                    "This output keeps its own volume, so ENVO can't change the level. AirPlay receivers, HDMI and some external audio devices work this way. Adjust on the device itself, or switch to the phone speaker, headphones or a Bluetooth speaker.")
+        }
+        if engine.isMicrophoneObstructed {
+            return ("MIC COVERED",
+                    "The microphone sounds muffled — a pocket, a bag, or the phone lying face-down. ENVO is holding its current adjustment rather than acting on a reading it can't trust. Set the phone down with the bottom edge clear and it will resume on its own.")
+        }
+        if engine.isInputClipping {
+            return ("ROOM TOO LOUD TO MEASURE",
+                    "The microphone is at its limit, so the level has stopped tracking the room. ENVO is holding its adjustment until it can measure again.")
+        }
+        if engine.isWaitingForPlayback {
+            return ("NOTHING PLAYING",
+                    "ENVO has handed the volume back and is still reading the room. It picks up again as soon as something plays.")
+        }
+        return nil
+    }
+
+    @ViewBuilder
+    private var advisoryView: some View {
+        if engine.isActive, let notice = advisoryNotice {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(notice.title)
+                    .font(.envo(size: 9))
+                    .foregroundColor(.white)
+                    .kerning(2)
+                Text(notice.detail)
+                    .font(.envo(size: 9))
+                    .foregroundColor(.gray)
+                    .lineSpacing(2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .overlay(
+                Rectangle().stroke(Color.white.opacity(0.35), lineWidth: 1)
+            )
+            .padding(.horizontal, 24)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(notice.title). \(notice.detail)")
+        }
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

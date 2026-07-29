@@ -406,7 +406,14 @@ final class CalibrationManager: ObservableObject {
                     return
                 }
                 self.silenceFloorDB = avgDB
-                self.log("Silence floor: \(Self.fmt(avgDB)) dBFS  (~\(AudioManager.approximateSPL(fromDBFS: avgDB)) dB SPL)")
+                self.log("Silence floor: \(Self.fmt(avgDB)) dBFS  (~\(AudioManager.approximateSPL(fromDBFS: avgDB)) dB masking-weighted)")
+                // The A-weighted figure is the one that is directly comparable
+                // to a dB(A) sound level meter, which the masking-weighted
+                // control level deliberately is not. Logged so the numbers can
+                // be checked against any SPL app.
+                if let am = self.audioManager {
+                    self.log("Room, A-weighted: ~\(AudioManager.approximateAWeightedSPL(fromDBFS: am.aWeightedLevelDB)) dB(A)")
+                }
                 self.log("")
                 self.progress = 1.0 / Float(self.volumeSteps.count + 1)
                 self.measureVolumeStep(index: 0)

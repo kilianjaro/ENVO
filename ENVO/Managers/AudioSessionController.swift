@@ -145,6 +145,39 @@ final class AudioSessionController {
         AVAudioSession.sharedInstance().currentRoute.outputs.first?.portName ?? "unknown"
     }
 
+    /// What the current output route implies about how much of ENVO's own
+    /// playback the built-in microphone will hear — the starting value for
+    /// `SelfCouplingEstimator` before it has measured anything.
+    ///
+    /// Erring high is the safe direction: over-estimating coupling makes ENVO
+    /// subtract more of its own output than it contributed, which makes the loop
+    /// *less* willing to raise the volume. Under-estimating leaves the loop
+    /// partly steering on itself, which is the fault being fixed.
+    var selfCouplingPrior: Float {
+        guard let port = currentOutputPortType else { return 0.35 }
+        switch port {
+        case .builtInSpeaker:
+            // Speaker and microphone are the same object, a few centimetres
+            // apart. It hears itself; the only question is how much.
+            return 0.75
+
+        case .headphones, .builtInReceiver, .bluetoothHFP, .bluetoothLE, .headsetMic:
+            // Sealed or held to the ear. Essentially nothing reaches the mic.
+            return 0.0
+
+        case .bluetoothA2DP, .airPlay, .HDMI, .usbAudio, .carAudio, .lineOut:
+            // Genuinely ambiguous, and not resolvable from the port type: A2DP
+            // is AirPods and a room stereo alike. A middle value roughly halves
+            // the worst-case gain inflation on a speaker while costing a
+            // headphone listener about 12% of their compensation — and a single
+            // completed observation replaces it with the truth either way.
+            return 0.35
+
+        default:
+            return 0.35
+        }
+    }
+
     /// True when audio is going somewhere other than the phone's own speaker.
     var isExternalOutputRoute: Bool {
         AVAudioSession.sharedInstance().currentRoute.outputs.contains {

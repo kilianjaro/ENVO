@@ -22,19 +22,35 @@ import Foundation
 /// ----------------------
 /// Tracks a low percentile of the recent level history. Music and speech are
 /// dynamic: between beats, between words, in decays and pauses, the microphone
-/// hears mostly the room. The 20th percentile of a 10–60 second window
-/// therefore approximates the ambient floor closely, and it does so whether or
-/// not anything is playing and whether or not a calibration profile exists.
+/// hears mostly the room. A low percentile of a 10–60 second window therefore
+/// approximates the ambient floor closely, and it does so whether or not
+/// anything is playing and whether or not a calibration profile exists.
+///
+/// WHICH PERCENTILE, AND HOW OFTEN
+/// -------------------------------
+/// L90 — the level exceeded 90% of the time, i.e. the 10th percentile of the
+/// sorted window. This is the standard statistic for a residual noise floor in
+/// environmental acoustics, and it sits further under the programme material
+/// than the 20th percentile this used to take, which matters for dense music
+/// where the distribution is narrow to begin with.
+///
+/// A low percentile is only as good as the number of samples behind it. The
+/// engine feeds this at 10 Hz rather than the 1 Hz it used to: an L90 over ten
+/// samples is the single lowest of ten, which is an estimator with several dB
+/// of variance and no room change required to produce it. At 10 Hz the same
+/// ten-second window carries a hundred samples and the estimate is steady.
 ///
 /// FEEDBACK STABILITY
 /// ------------------
 /// ENVO raising the volume does raise the microphone reading, so there is a
-/// loop. Its gain is `compensationGain × musicFraction`, where musicFraction
-/// is how much of the *floor* is our own playback. The floor is measured at
-/// the quiet moments of the program material, so musicFraction is small there;
-/// and `compensationGain` is 0.4. The loop gain is well under 1 in every case,
-/// so it converges rather than running away — and the range clamp bounds it
-/// absolutely regardless.
+/// loop. Its gain is `compensationGain × coupling`, where coupling is how much
+/// of the *floor* is our own playback. For speech material the floor sits in
+/// the gaps and coupling is small; for heavily limited music on a speaker it
+/// approaches 1, and the effective gain would rise from the 0.4 this was tuned
+/// for to about 0.67. `SelfCouplingEstimator` measures that coupling from
+/// ENVO's own volume steps and removes it before the control law ever sees the
+/// number, so the loop runs at its design gain on any material. The range clamp
+/// bounds the result absolutely regardless.
 struct AmbientTracker: Equatable {
 
     /// Which percentile of the window counts as "the floor". Low enough to sit
@@ -56,9 +72,9 @@ struct AmbientTracker: Equatable {
 
     private let capacity: Int
 
-    init(percentile: Float = 0.2,
-         minimumSamples: Int = 5,
-         capacity: Int = 60,
+    init(percentile: Float = 0.1,
+         minimumSamples: Int = 20,
+         capacity: Int = 600,
          floorToleranceDB: Float = 6.0) {
         self.percentile = min(max(percentile, 0.0), 1.0)
         self.minimumSamples = max(1, minimumSamples)

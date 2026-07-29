@@ -3,6 +3,79 @@ import AVFoundation
 import Accelerate
 import Combine
 
+/// One drained microphone observation.
+///
+/// The engine ticks at 1 Hz but reads the microphone at 10 Hz, because the
+/// statistics it computes need samples, not ticks. `AmbientTracker`'s L90 over a
+/// ten-second window is the lowest of ten readings when sampled once per second
+/// — an estimator with several decibels of variance produced by nothing but
+/// chance. At 10 Hz the same window carries a hundred readings.
+///
+/// Everything the engine needs about a moment is carried together, so the level
+/// and the spectral descriptors measured alongside it can never drift apart.
+struct AmbientSample: Equatable {
+    /// Masking-weighted level in dBFS — the signal the control loop steers on.
+    let controlLevelDB: Float
+    /// A-weighted broadband level in dBFS. Diagnostic: this is the number that
+    /// is comparable to a dB(A) sound level meter.
+    let aWeightedLevelDB: Float
+    /// 0…1 estimate of how speech-like the room is right now.
+    let speechLikeness: Float
+    /// Share of band energy above 1 kHz. Feeds obstruction detection.
+    let highFrequencyShare: Float
+    /// The input hit full scale during this interval, so the level is a floor
+    /// on the truth rather than the truth.
+    let isClipping: Bool
+    /// Seconds this sample represents.
+    let dt: Float
+}
+
+/// Audio-thread-owned processing state.
+///
+/// A class, and captured **strongly** by the input tap, on purpose. The
+/// previous code kept this state on `AudioManager` and cleared it from the main
+/// thread during teardown, while `removeTap(onBus:)` gives no guarantee that a
+/// callback is not already running. Releasing a filter's coefficient array out
+/// from under a buffer being processed is a data race on a heap object, and the
+/// failure mode is a crash rather than a wrong number. Holding it from the
+/// closure means an in-flight callback keeps the object alive until it returns,
+/// and teardown merely drops the manager's own reference.
+private final class LevelProcessor {
+
+    let sampleRate: Double
+    var aWeighting: AWeightingFilter
+    var bands: OctaveBandAnalyzer
+    var modulation = ModulationDetector()
+
+    /// IEC 61672 Fast time weighting: a 125 ms exponential average in the power
+    /// domain. The previous smoothing coefficient (0.3 retained per buffer)
+    /// worked out to a ~19 ms time constant, so each reading the engine took was
+    /// effectively an instantaneous snapshot of one twentieth of a second rather
+    /// than an integrated level. Fast is the standard short integration and is
+    /// what makes a percentile over the window mean something.
+    static let fastTimeConstant: Float = 0.125
+
+    var smoothedControlDB: Float = AcousticMath.silenceDB
+    var smoothedAWeightedDB: Float = AcousticMath.silenceDB
+    var seeded = false
+
+    var speechLikeness: Float = 0
+    var highFrequencyShare: Float = 0
+
+    /// Sticky within a publish interval: one clipped buffer taints the whole
+    /// reading, and a peak that just touched full scale is usually accompanied
+    /// by neighbours that nearly did.
+    var sawClipping = false
+
+    var lastPublish: CFAbsoluteTime = 0
+
+    init(sampleRate: Double) {
+        self.sampleRate = sampleRate
+        self.aWeighting = AWeightingFilter(sampleRate: sampleRate)
+        self.bands = OctaveBandAnalyzer(sampleRate: sampleRate)
+    }
+}
+
 /// Manages microphone input for ambient noise level measurement.
 /// IMPORTANT: No audio data is recorded or stored. Only instantaneous
 /// power levels are read from the audio engine's input node.
@@ -10,13 +83,15 @@ final class AudioManager: ObservableObject {
 
     // MARK: - Published State
 
-    /// Smoothed input level in dBFS. **This is the engine's primary signal.**
-    /// Everything that reasons about loudness works in dB from here on; the
-    /// normalized 0…1 value below is for drawing only.
+    /// Masking-weighted level in dBFS. **This is the engine's primary signal**,
+    /// and since it is also what the UI displays, what the user sees is what the
+    /// loop acts on. See `MaskingWeighting` for why this is not A-weighted.
     @Published private(set) var levelDB: Float = AcousticMath.silenceDB
 
-    /// Deprecated alias kept for the visualizer's history buffer.
-    @Published private(set) var currentLevel: Float = AcousticMath.silenceDB
+    /// A-weighted broadband level in dBFS. Not used for control — published so
+    /// the calibration log can report a figure that is directly comparable to a
+    /// dB(A) sound level meter, which the masking-weighted number is not.
+    @Published private(set) var aWeightedLevelDB: Float = AcousticMath.silenceDB
 
     /// Display-only 0…1 mapping of `levelDB`. Never use this for arithmetic:
     /// it is linear in *decibels*, so multiplying or ratioing it is
@@ -32,14 +107,41 @@ final class AudioManager: ObservableObject {
     enum PermissionState { case undetermined, granted, denied }
     @Published private(set) var permissionState: PermissionState = .undetermined
 
-    /// Share of total energy in the 300–3000 Hz voice band, smoothed.
-    /// Used by the engine for anti-Lombard correction so people talking
-    /// over the music doesn't drive the offset upward.
-    @Published private(set) var voiceBandShare: Float = 0.0
+    /// 0…1 estimate of how speech-like the ambient noise is, combining a
+    /// spectral and a temporal measurement. Used by the engine for anti-Lombard
+    /// correction so people talking louder doesn't drive the offset upward.
+    ///
+    /// Replaces the previous `voiceBandShare`, which compared the energy in four
+    /// 43 Hz-wide Goertzel bins against three others and called the ratio a
+    /// band share. That measurement was blind to everything between the probe
+    /// frequencies, leaked low-frequency energy into every bin through an
+    /// unwindowed transform, and could not distinguish speech from any other
+    /// broadband sound. See `MaskingWeighting.speechBandShare` and
+    /// `ModulationDetector`.
+    @Published private(set) var speechLikeness: Float = 0.0
+
+    /// True when the input recently hit full scale. An iPhone microphone clips
+    /// somewhere around 105–110 dB SPL, and past that point the reading
+    /// compresses and stops tracking the room — exactly where a volume
+    /// controller most needs to be honest about not knowing.
+    @Published private(set) var isClipping: Bool = false
+
+    /// Readings taken since the engine last drained, oldest first.
+    ///
+    /// Appended on the main thread from the publish block and drained on the
+    /// main thread by the engine tick, so no locking is involved and the audio
+    /// thread is never blocked.
+    ///
+    /// Deliberately **not** `@Published`: nothing observes it, and publishing it
+    /// would fire `objectWillChange` ten times a second, re-rendering every view
+    /// that holds `AudioManager` as an `EnvironmentObject` for data none of them
+    /// read.
+    private var pendingSamples: [AmbientSample] = []
 
     // MARK: - Private
 
     private var audioEngine: AVAudioEngine?
+    private var processor: LevelProcessor?
 
     /// Synchronous flag separate from the @Published isMonitoring.
     /// Prevents double-start races where two callers pass the guard
@@ -47,21 +149,17 @@ final class AudioManager: ObservableObject {
     private let stateQueue = DispatchQueue(label: "envo.audiomanager.state")
     private var isStarting: Bool = false
 
-    /// Weight retained from the previous sample when smoothing, applied in
-    /// the power domain (see AcousticMath.emaDB).
-    private let smoothingFactor: Float = 0.3
-
     /// Display range for `normalizedLevel`.
     ///
-    /// The old floor of −60 dBFS was the single most damaging constant in
-    /// the app: a quiet room measures −65…−80 dBFS on an iPhone mic, so
-    /// every reading in a quiet room clamped to exactly 0. Calibration then
-    /// recorded a silence floor of zero and zero device contribution for the
-    /// lower volume steps, and gap detection fired on every tick.
-    static let displayFloorDB: Float = -80.0
-    static let displayCeilingDB: Float = -10.0
+    /// Shifted down relative to the old A-weighted broadband range. The control
+    /// level is a weighted average of *octave-band* levels, and a broadband room
+    /// spreads its energy over roughly eight octaves, so any one band sits about
+    /// 9 dB below the broadband figure. The visualizer would otherwise spend its
+    /// life in the bottom fifth of its scale.
+    static let displayFloorDB: Float = -90.0
+    static let displayCeilingDB: Float = -20.0
 
-    /// Approximate dB(A) SPL of a full-scale reading on the built-in mic.
+    /// Approximate dB SPL of a full-scale **control level** reading.
     ///
     /// Turning dBFS into an SPL figure requires knowing the microphone's
     /// absolute sensitivity, which iOS does not expose and which varies by
@@ -69,32 +167,34 @@ final class AudioManager: ObservableObject {
     /// calibration**, and the displayed number should be read as
     /// "approximately", ±10 dB.
     ///
-    /// Lowered from 120: with the old value a normal room read around 70 dB
-    /// SPL, which is nearer a busy street than a living room. What the readout
-    /// can be trusted for is *change* — it is 1:1 in dB, so a room that gets
-    /// 10 dB louder moves the number by 10.
-    static let fullScaleSPL: Float = 105.0
+    /// It is offset from `aWeightedFullScaleSPL` below by the band-splitting
+    /// difference described on `displayFloorDB`, plus a couple of dB for the
+    /// bandpass cascade's narrowed passband. Both are constant offsets, so what
+    /// the readout can be trusted for is *change*: it is 1:1 in dB, and a room
+    /// that gets 10 dB louder moves the number by 10.
+    ///
+    /// TODO: verify on device against a reference sound level meter. Only this
+    /// one constant needs to move to make the absolute figure right.
+    static let fullScaleSPL: Float = 117.0
 
-    /// Rebuilt whenever the input sample rate changes (route change, engine
-    /// rebuild). Audio-thread-only.
-    private var aWeighting: AWeightingFilter?
+    /// Same idea for the A-weighted diagnostic level, which unlike the control
+    /// level *is* directly comparable to any dB(A) meter.
+    static let aWeightedFullScaleSPL: Float = 105.0
 
-    private var smoothedLevel: Float = AcousticMath.silenceDB
-    private var hasSeededLevel = false
-    private var smoothedVoiceShare: Float = 0.0
-    private let voiceShareSmoothing: Float = 0.85
+    /// Audio-thread-only. Gates the main-thread @Published writes to
+    /// ~10 Hz — the rate the engine samples at, and plenty for the 30 fps
+    /// visualizer (which has its own decay smoothing) — instead of publishing
+    /// at buffer rate (~45 Hz) even while backgrounded.
+    private let publishInterval: CFAbsoluteTime = 0.1
+
+    /// Cap on the undrained queue, so a stalled engine cannot grow it without
+    /// bound. Ten seconds of readings is far more than a tick ever needs.
+    private let maxPendingSamples = 100
 
     /// Wall-clock time of the last buffer delivered by the input tap.
     /// `AVAudioEngine.isRunning` can report true while no buffers arrive;
     /// this is the signal that actually proves the mic is alive.
     private var lastBufferTime: CFAbsoluteTime = 0
-
-    /// Audio-thread-only. Gates the main-thread @Published writes to
-    /// ~10 Hz — plenty for the 1 Hz engine and the 30 fps visualizer
-    /// (which has its own decay smoothing), instead of publishing at
-    /// buffer rate (~40 Hz) even while backgrounded.
-    private var lastPublishTime: CFAbsoluteTime = 0
-    private let publishInterval: CFAbsoluteTime = 0.09
 
     /// Rebuilds the engine when the input configuration changes underneath
     /// it (headphone plug/unplug, route format change). Without this the
@@ -148,6 +248,16 @@ final class AudioManager: ObservableObject {
     func isReceivingAudio(within seconds: CFAbsoluteTime = 1.5) -> Bool {
         guard isEngineRunning, lastBufferTime > 0 else { return false }
         return CFAbsoluteTimeGetCurrent() - lastBufferTime <= seconds
+    }
+
+    // MARK: - Sample queue
+
+    /// Take everything measured since the last call. Main thread only.
+    func drainPendingSamples() -> [AmbientSample] {
+        guard !pendingSamples.isEmpty else { return [] }
+        let drained = pendingSamples
+        pendingSamples = []
+        return drained
     }
 
     // MARK: - Setup
@@ -258,8 +368,13 @@ final class AudioManager: ObservableObject {
             return
         }
 
+        // Built once per engine, at the route's rate. Captured strongly by the
+        // tap below so teardown cannot pull it out from under a running buffer.
+        let processor = LevelProcessor(sampleRate: format.sampleRate)
+        self.processor = processor
+
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.processBuffer(buffer)
+            self?.processBuffer(buffer, using: processor)
         }
 
         do {
@@ -287,6 +402,7 @@ final class AudioManager: ObservableObject {
             Log.audio.error("AudioEngine start failed: \(error.localizedDescription, privacy: .public)")
             inputNode.removeTap(onBus: 0)
             self.audioEngine = nil
+            self.processor = nil
         }
         stateQueue.sync { isStarting = false }
     }
@@ -299,9 +415,11 @@ final class AudioManager: ObservableObject {
             self.isMonitoring = false
             if hadEngine {
                 self.levelDB = AcousticMath.silenceDB
-                self.currentLevel = AcousticMath.silenceDB
+                self.aWeightedLevelDB = AcousticMath.silenceDB
                 self.normalizedLevel = 0.0
-                self.voiceBandShare = 0.0
+                self.speechLikeness = 0.0
+                self.isClipping = false
+                self.pendingSamples = []
             }
         }
     }
@@ -313,155 +431,157 @@ final class AudioManager: ObservableObject {
             configChangeToken = nil
         }
         guard let engine = audioEngine else { return }
-        // Remove tap first so no more buffers arrive after teardown.
+        // Remove the tap first so no *new* buffers arrive. A callback already
+        // running keeps the processor alive through its own strong capture, so
+        // dropping our reference here is safe even mid-buffer.
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
         audioEngine = nil
-        aWeighting = nil
-        smoothedLevel = AcousticMath.silenceDB
-        hasSeededLevel = false
-        smoothedVoiceShare = 0.0
+        processor = nil
         lastBufferTime = 0
     }
 
     // MARK: - Audio Processing
 
-    private func processBuffer(_ buffer: AVAudioPCMBuffer) {
+    private func processBuffer(_ buffer: AVAudioPCMBuffer, using p: LevelProcessor) {
         guard let channelData = buffer.floatChannelData else { return }
 
-        let channelDataValue = channelData.pointee
+        let samples = channelData.pointee
         let frameLength = Int(buffer.frameLength)
         guard frameLength > 0 else { return }
 
-        // A-weight before measuring. Unweighted RMS is dominated by
-        // low-frequency energy — traffic rumble, ventilation, the body of a
-        // bus — which contributes little to whether speech or music is
-        // audible, but a great deal to the number. Weighting is what makes the
-        // reading track *perceived* loudness, and what makes it comparable to
-        // a dB(A) sound level meter. Goertzel voice-band detection below
-        // deliberately stays on the unweighted signal, since it is a ratio
-        // between bands and weighting would bias it.
-        let sampleRateNow = buffer.format.sampleRate
-        if aWeighting == nil || aWeighting?.sampleRate != sampleRateNow, sampleRateNow > 0 {
-            aWeighting = AWeightingFilter(sampleRate: sampleRateNow)
-        }
+        let dt = Float(frameLength) / Float(p.sampleRate)
+        guard dt > 0 else { return }
 
-        var rms: Float = 0.0
-        if aWeighting != nil {
-            // Accumulate in place rather than filtering into a scratch buffer:
-            // no allocation on the audio thread.
-            var sumSquares: Float = 0
-            for i in 0..<frameLength {
-                let weighted = aWeighting!.process(channelDataValue[i])
-                sumSquares += weighted * weighted
-            }
-            rms = (sumSquares / Float(frameLength)).squareRoot()
-        } else {
-            vDSP_rmsqv(channelDataValue, 1, &rms, vDSP_Length(frameLength))
-        }
+        // Peak first: clipping invalidates everything downstream, and the
+        // cheapest possible check is worth doing before the filtering.
+        var peak: Float = 0
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(frameLength))
+        guard peak.isFinite else { return }
+        if peak >= 0.99 { p.sawClipping = true }
 
-        // Guard against NaN/Inf that can arise on the very first buffer.
-        guard rms.isFinite else { return }
+        // ── Octave-band analysis: the control signal ──
+        // The masking-weighted level, not a broadband one. Ears are less
+        // sensitive at low frequencies, but low-frequency noise *masks upward*
+        // into the midrange far more than any loudness weighting suggests —
+        // which is why a bus or an aircraft cabin destroys intelligibility while
+        // reading unremarkably on a dB(A) meter. See MaskingWeighting.
+        p.bands.analyze(samples, count: frameLength)
+        let controlDB = MaskingWeighting.maskingLevelDB(p.bands.bandLevelsDB,
+                                                        activeBandCount: p.bands.activeBandCount)
+        let spectralSpeech = MaskingWeighting.speechBandShare(p.bands.bandLevelsDB,
+                                                              activeBandCount: p.bands.activeBandCount)
+        let highShare = MaskingWeighting.highFrequencyShare(p.bands.bandLevelsDB,
+                                                            activeBandCount: p.bands.activeBandCount)
+
+        // ── A-weighted broadband: the diagnostic ──
+        // Accumulated in place rather than filtered into a scratch buffer, so
+        // there is no allocation on the audio thread.
+        var sumSquares: Float = 0
+        for i in 0..<frameLength {
+            let weighted = p.aWeighting.process(samples[i])
+            sumSquares += weighted * weighted
+        }
+        let aRMS = (sumSquares / Float(frameLength)).squareRoot()
+        let aDB: Float = aRMS > 0 ? max(20.0 * log10f(aRMS), AcousticMath.silenceDB)
+                                  : AcousticMath.silenceDB
+
+        guard controlDB.isFinite, aDB.isFinite else { return }
 
         lastBufferTime = CFAbsoluteTimeGetCurrent()
 
-        let db: Float = rms > 0 ? max(20.0 * log10f(rms), AcousticMath.silenceDB)
-                                : AcousticMath.silenceDB
-        guard db.isFinite else { return }
-
-        // Seed rather than ramp: starting the average at digital silence
-        // meant the first readings after every start (and after every mic
-        // rebuild) were artificially low.
-        if !hasSeededLevel {
-            smoothedLevel = db
-            hasSeededLevel = true
+        // ── Fast (125 ms) time weighting, in the power domain ──
+        let retention = expf(-dt / LevelProcessor.fastTimeConstant)
+        if !p.seeded {
+            // Seed rather than ramp: starting the average at digital silence
+            // made the first readings after every start (and after every mic
+            // rebuild) artificially low.
+            p.smoothedControlDB = controlDB
+            p.smoothedAWeightedDB = aDB
+            p.seeded = true
         } else {
-            smoothedLevel = AcousticMath.emaDB(current: smoothedLevel,
-                                               sample: db,
-                                               retention: smoothingFactor)
+            p.smoothedControlDB = AcousticMath.emaDB(current: p.smoothedControlDB,
+                                                     sample: controlDB,
+                                                     retention: retention)
+            p.smoothedAWeightedDB = AcousticMath.emaDB(current: p.smoothedAWeightedDB,
+                                                       sample: aDB,
+                                                       retention: retention)
         }
 
-        let dbSnapshot = smoothedLevel
-        let clamped = min(max(smoothedLevel,
-                              AudioManager.displayFloorDB),
-                          AudioManager.displayCeilingDB)
-        let normalized = (clamped - AudioManager.displayFloorDB)
-            / (AudioManager.displayCeilingDB - AudioManager.displayFloorDB)
+        // ── Speech likeness: spectral shape and syllabic modulation ──
+        // Fed at buffer rate, not at the publish rate: resolving a 2–8 Hz
+        // envelope needs samples well above 16 Hz.
+        //
+        // Fed the *unsmoothed* level, deliberately. The Fast time weighting is a
+        // 125 ms one-pole, which attenuates a 4 Hz envelope component to about
+        // 30% — it would remove most of the very modulation this is trying to
+        // measure. The per-buffer level is a ~21 ms integration, which passes
+        // the syllabic band essentially intact at the cost of a little more
+        // statistical scatter; `ModulationDetector`'s floor is set for that.
+        p.modulation.ingest(levelDB: controlDB, dt: dt)
 
-        // Voice-band energy via Goertzel at four frequencies spanning
-        // the typical speech fundamental + first formant range.
-        // Cheaper than a full FFT and runs comfortably per-buffer.
-        let sampleRate = Float(buffer.format.sampleRate)
-        if rms > 0.0005, sampleRate > 0 {
-            let voiceFreqs: [Float] = [350, 800, 1500, 2400]
-            let nonVoiceFreqs: [Float] = [80, 5000, 8000]
-            var voiceEnergy: Float = 0
-            for f in voiceFreqs {
-                voiceEnergy += AudioManager.goertzelPower(
-                    samples: channelDataValue,
-                    count: frameLength,
-                    frequency: f,
-                    sampleRate: sampleRate
-                )
-            }
-            var nonVoiceEnergy: Float = 0
-            for f in nonVoiceFreqs {
-                nonVoiceEnergy += AudioManager.goertzelPower(
-                    samples: channelDataValue,
-                    count: frameLength,
-                    frequency: f,
-                    sampleRate: sampleRate
-                )
-            }
-            let total = voiceEnergy + nonVoiceEnergy
-            let share: Float = total > 0 ? voiceEnergy / total : 0
-            smoothedVoiceShare = voiceShareSmoothing * smoothedVoiceShare
-                + (1.0 - voiceShareSmoothing) * share
-        } else {
-            // Near-silent buffer: drift toward zero.
-            smoothedVoiceShare *= voiceShareSmoothing
-        }
-        let voiceShareSnapshot = smoothedVoiceShare
+        // Averaged rather than multiplied, because the two measurements fail in
+        // opposite situations and neither should be able to veto the other.
+        // Many-talker babble averages toward steady noise and loses its
+        // modulation, but keeps its speech-shaped spectrum; a broadband hiss in
+        // a room with no low end reads spectrally speech-like but does not
+        // modulate. Requiring both would miss the first; accepting either would
+        // fire on the second.
+        p.speechLikeness = AcousticMath.clamp(
+            0.5 * spectralSpeechScore(spectralSpeech) + 0.5 * p.modulation.score, 0, 1
+        )
+        p.highFrequencyShare = highShare
 
         // Smoothing state above updates on every buffer; only the
         // main-thread publish is rate-limited.
         let now = CFAbsoluteTimeGetCurrent()
-        guard now - lastPublishTime >= publishInterval else { return }
-        lastPublishTime = now
+        let elapsed = now - p.lastPublish
+        guard elapsed >= publishInterval else { return }
+        let interval = p.lastPublish > 0 ? Float(elapsed) : Float(publishInterval)
+        p.lastPublish = now
+
+        let sample = AmbientSample(
+            controlLevelDB: p.smoothedControlDB,
+            aWeightedLevelDB: p.smoothedAWeightedDB,
+            speechLikeness: p.speechLikeness,
+            highFrequencyShare: p.highFrequencyShare,
+            isClipping: p.sawClipping,
+            dt: interval
+        )
+        p.sawClipping = false
+
+        let clamped = min(max(sample.controlLevelDB, AudioManager.displayFloorDB),
+                          AudioManager.displayCeilingDB)
+        let normalized = (clamped - AudioManager.displayFloorDB)
+            / (AudioManager.displayCeilingDB - AudioManager.displayFloorDB)
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.levelDB = dbSnapshot
-            self.currentLevel = dbSnapshot
+            self.levelDB = sample.controlLevelDB
+            self.aWeightedLevelDB = sample.aWeightedLevelDB
             self.normalizedLevel = normalized
-            self.voiceBandShare = voiceShareSnapshot
+            self.speechLikeness = sample.speechLikeness
+            self.isClipping = sample.isClipping
+
+            self.pendingSamples.append(sample)
+            if self.pendingSamples.count > self.maxPendingSamples {
+                self.pendingSamples.removeFirst(self.pendingSamples.count - self.maxPendingSamples)
+            }
         }
     }
 
-    /// Single-frequency Goertzel power estimate. Pure, threadsafe.
-    private static func goertzelPower(samples: UnsafePointer<Float>,
-                                      count: Int,
-                                      frequency: Float,
-                                      sampleRate: Float) -> Float {
-        let omega = 2.0 * Float.pi * frequency / sampleRate
-        let coeff = 2.0 * cosf(omega)
-        var s0: Float = 0, s1: Float = 0, s2: Float = 0
-        for i in 0..<count {
-            s0 = samples[i] + coeff * s1 - s2
-            s2 = s1
-            s1 = s0
-        }
-        let power = s1 * s1 + s2 * s2 - coeff * s1 * s2
-        return max(0, power)
-    }
-
-    /// Rough dB SPL for the on-screen readout.
+    /// Maps the 250 Hz–2 kHz energy share onto 0…1.
     ///
-    /// The previous version mapped the normalized level onto 30…110, i.e. it
-    /// stretched 55 dB of measured range across 80 dB of displayed range —
-    /// every change was shown ~45% larger than it was. This is a straight
-    /// dBFS→SPL offset, so displayed changes match real ones even though the
-    /// absolute value is only an estimate.
+    /// Traffic, ventilation and engine noise land around 0.1–0.2 because their
+    /// energy is dominated by 125 Hz and below. Speech babble peaks near 500 Hz
+    /// and lands around 0.5–0.6. The ramp brackets the gap between them.
+    private func spectralSpeechScore(_ share: Float) -> Float {
+        AcousticMath.clamp((share - 0.25) / (0.55 - 0.25), 0, 1)
+    }
+
+    // MARK: - Display
+
+    /// Rough dB SPL of the control level, for the on-screen readout.
     var approximateDB: Int {
         guard isMonitoring, levelDB > AcousticMath.silenceDB else { return 0 }
         return Int((levelDB + AudioManager.fullScaleSPL).rounded())
@@ -469,5 +589,11 @@ final class AudioManager: ObservableObject {
 
     static func approximateSPL(fromDBFS dbfs: Float) -> Int {
         Int((dbfs + fullScaleSPL).rounded())
+    }
+
+    /// dB(A) equivalent of an A-weighted reading — the figure that is
+    /// comparable to a sound level meter. Used in the calibration log.
+    static func approximateAWeightedSPL(fromDBFS dbfs: Float) -> Int {
+        Int((dbfs + aWeightedFullScaleSPL).rounded())
     }
 }

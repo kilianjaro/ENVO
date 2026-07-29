@@ -86,9 +86,29 @@ final class EnvoEngine: ObservableObject {
     /// Normalized 0…1 history for the visualizer. Display only.
     @Published private(set) var levelHistory: [Float] = []
 
+    /// What the hardware is actually delivering, in dB, relative to the user's
+    /// baseline. Differs from `currentOffsetDB` — the intent — by up to half a
+    /// hardware step, because the system volume is quantized. This is what the
+    /// readout shows: the intent is what ENVO wants, and showing it as though it
+    /// were the result meant the app's most prominent number was routinely
+    /// 1.5 dB away from anything the user could hear.
+    @Published private(set) var deliveredOffsetDB: Float = 0
+
     /// True when the live room floor disagrees materially with the calibrated
     /// one. Surfaced as a "recalibrate?" hint.
     @Published private(set) var calibrationStale: Bool = false
+
+    /// The microphone appears to be covered — pocket, bag, face-down. The
+    /// adjustment is held while this is true, and the UI says so.
+    @Published private(set) var isMicrophoneObstructed: Bool = false
+
+    /// The input is hitting full scale, so the level reading has stopped
+    /// tracking the room. Held, not acted on.
+    @Published private(set) var isInputClipping: Bool = false
+
+    /// Nothing else is playing, so there is nothing to adapt. ENVO keeps
+    /// measuring the room but leaves the volume alone.
+    @Published private(set) var isWaitingForPlayback: Bool = false
 
     /// Set when START could not proceed, so the UI can say why instead of
     /// silently doing nothing.
@@ -157,10 +177,27 @@ final class EnvoEngine: ObservableObject {
 
     private let sampleInterval: TimeInterval = 1.0
 
+    /// Microphone readings per second. The loop still *decides* once a second,
+    /// but it *measures* ten times a second, because the floor is an order
+    /// statistic and an order statistic needs samples. At 1 Hz the L90 of a
+    /// ten-second window was the single lowest of ten readings — an estimator
+    /// whose several-decibel scatter came from nothing but which millisecond
+    /// each reading happened to land on.
+    static let micSamplesPerSecond = 10
+
     /// Rolling microphone history, from which the ambient floor is derived.
-    private var ambientTracker = AmbientTracker(percentile: 0.2,
-                                                minimumSamples: 5,
-                                                capacity: 60)
+    /// L90 over up to sixty seconds at 10 Hz.
+    private var ambientTracker = AmbientTracker(percentile: 0.1,
+                                                minimumSamples: 20,
+                                                capacity: 600)
+
+    /// Removes ENVO's own contribution from the measured floor. See
+    /// `SelfCouplingEstimator` — without it the loop partly steers on its own
+    /// output whenever dense music is playing through a speaker.
+    private var selfCoupling = SelfCouplingEstimator()
+
+    /// Spots a covered microphone, which a low percentile follows straight down.
+    private var obstructionDetector = ObstructionDetector()
 
     /// Estimated-ambient history, for the visualizer.
     private var ambientSamplesDB: [Float] = []
@@ -202,11 +239,26 @@ final class EnvoEngine: ObservableObject {
     private var appliedSliderOffset: Float = 0.0
     private let sliderChangeThreshold: Float = 0.004
 
-    /// Consecutive ticks with a dead mic, for logging only — the offset is
-    /// held regardless.
+    /// Consecutive ticks with a dead mic. The offset is held regardless; this
+    /// drives the revival backoff and the logging.
     private var deadMicTicks = 0
 
-    private var spikeFilter = SpikeFilter(windowSize: 12, spikeRatio: 2.5, minimumMargin: 1.0)
+    /// Ticks to wait before the next attempt to rebuild the input engine, and
+    /// how long since the last one. Rebuilding once a second forever hammers
+    /// the audio subsystem during exactly the system-wide trouble that caused
+    /// the failure, floods the log, and costs battery for no benefit. Doubles
+    /// to a thirty-second ceiling instead.
+    private var revivalBackoffTicks = 1
+    private var ticksSinceRevival = 0
+    private let maxRevivalBackoffTicks = 30
+
+    /// Consecutive ticks with nothing else playing. Debounced, because the gap
+    /// between two tracks is not the user having stopped listening.
+    private var idlePlaybackTicks = 0
+    private let playbackIdleConfirmTicks = 5
+
+    /// Three-second window at 10 Hz.
+    private var spikeFilter = SpikeFilter(windowSize: 31, spikeRatio: 2.5, minimumMargin: 1.0)
 
     private var routeChangeToken: NSObjectProtocol?
 
@@ -296,6 +348,7 @@ final class EnvoEngine: ObservableObject {
         registerRouteObserver()
 
         resetControlState()
+        selfCoupling.prior = AudioSessionController.shared.selfCouplingPrior
 
         engineTimer = Timer.scheduledTimer(withTimeInterval: sampleInterval, repeats: true) { [weak self] _ in
             self?.tick()
@@ -334,14 +387,23 @@ final class EnvoEngine: ObservableObject {
         recentRawDB.removeAll()
         ambientTracker.reset()
         spikeFilter.reset()
+        selfCoupling.reset()
+        obstructionDetector.reset()
         warmupTicks = 0
         baselineAmbientDB = 0
         hasBaseline = false
         currentOffsetDB = 0
         currentSliderOffset = 0
         appliedSliderOffset = 0
+        deliveredOffsetDB = 0
         staleStreak = 0
         deadMicTicks = 0
+        revivalBackoffTicks = 1
+        ticksSinceRevival = 0
+        idlePlaybackTicks = 0
+        isWaitingForPlayback = false
+        isMicrophoneObstructed = false
+        isInputClipping = false
     }
 
     /// The user moved the volume by hand. Their new position is the new
@@ -376,6 +438,15 @@ final class EnvoEngine: ObservableObject {
         guard isActive else { return }
         volumeController.captureBaseVolume()
         reanchor(reason: "output route changed")
+
+        // How much of the microphone's floor is our own playback is a property
+        // of the acoustic path. Headphones couple essentially nothing; a
+        // speaker on the same desk couples nearly everything. Carrying the old
+        // number across a route change would be worse than starting again from
+        // what the new route implies.
+        selfCoupling.reset()
+        selfCoupling.prior = AudioSessionController.shared.selfCouplingPrior
+        obstructionDetector.reset()
     }
 
     /// Drop the adjustment and re-measure the room from here.
@@ -383,11 +454,15 @@ final class EnvoEngine: ObservableObject {
         currentOffsetDB = 0
         currentSliderOffset = 0
         appliedSliderOffset = 0
+        deliveredOffsetDB = 0
         hasBaseline = false
         warmupTicks = 0
         ambientTracker.reset()
         spikeFilter.reset()
         recentRawDB.removeAll()
+        // The delivered offset jumps to zero here without ENVO having stepped
+        // anything, which would look like a probe it never made.
+        selfCoupling.discardObservationInProgress()
         Log.engine.info("Re-anchoring (\(reason, privacy: .public)): adjustment zeroed, baseline re-measuring.")
     }
 
@@ -442,41 +517,98 @@ final class EnvoEngine: ObservableObject {
 
         // Watchdog. `isRunning` alone is not enough: the engine can report
         // running while its tap has stopped delivering buffers, in which case
-        // `levelDB` freezes at its last value and steering on it would be
-        // steering on a stale number. Hold the offset and try to revive.
+        // the readings freeze at their last value and steering on them would be
+        // steering on a stale number. Hold the offset and try to revive, with
+        // an exponential backoff so a persistent failure is not met with a
+        // rebuild attempt every single second forever.
         guard audioManager.isReceivingAudio() else {
             deadMicTicks += 1
-            if deadMicTicks == 1 || deadMicTicks % 10 == 0 {
-                Log.audio.error("Mic not delivering audio (\(self.deadMicTicks) ticks); holding offset and rebuilding.")
+            ticksSinceRevival += 1
+            if ticksSinceRevival >= revivalBackoffTicks {
+                ticksSinceRevival = 0
+                Log.audio.error("Mic not delivering audio (\(self.deadMicTicks) ticks); holding offset and rebuilding (next attempt in \(self.revivalBackoffTicks * 2)s).")
+                revivalBackoffTicks = min(revivalBackoffTicks * 2, maxRevivalBackoffTicks)
+                audioManager.stopMonitoring()
+                audioManager.startMonitoring()
             }
-            audioManager.stopMonitoring()
-            audioManager.startMonitoring()
             return
         }
-        deadMicTicks = 0
+        if deadMicTicks > 0 {
+            deadMicTicks = 0
+            revivalBackoffTicks = 1
+            ticksSinceRevival = 0
+        }
 
-        let rawDB = audioManager.levelDB
+        // ── Drain the 10 Hz readings taken since the last tick ──
+        let samples = audioManager.drainPendingSamples()
+        guard !samples.isEmpty else { return }
 
-        checkCalibrationDrift(rawDB: rawDB)
+        // Obstruction is judged on every reading, not once per tick: three
+        // seconds of evidence at 1 Hz is three samples, which is not evidence.
+        var obstructed = obstructionDetector.isObstructed
+        for sample in samples {
+            obstructed = obstructionDetector.ingest(levelDB: sample.controlLevelDB,
+                                                    highFrequencyShare: sample.highFrequencyShare,
+                                                    dt: sample.dt)
+        }
+        if obstructed != isMicrophoneObstructed {
+            isMicrophoneObstructed = obstructed
+            Log.engine.info("Microphone obstruction \(obstructed ? "detected" : "cleared", privacy: .public); adjustment \(obstructed ? "held" : "resumed", privacy: .public).")
+        }
 
-        // A2: blunt door slams and claps before they reach the floor estimate.
-        // The voice-band share is stored alongside the level it was measured
-        // with, so the Lombard damper can later look at the spectral character
-        // of the readings that actually defined the floor rather than of
-        // whatever happens to be arriving on this tick.
-        let despikedDB = spikeFilter.ingest(rawDB)
-        ambientTracker.ingest(despikedDB, voiceShare: audioManager.voiceBandShare)
+        // A clipped reading is compressed rather than wrong-by-an-offset: past
+        // full scale the microphone stops tracking the room at all. Such
+        // readings are kept out of the floor entirely rather than being fed in
+        // as an underestimate.
+        let usable = samples.filter { !$0.isClipping }
+        isInputClipping = usable.count < samples.count
 
-        let windowSamples = max(warmupCount, Int(speedMode.windowSeconds / sampleInterval))
+        // Both conditions mean the same thing: the number arriving is not a
+        // measurement of the room. Hold, exactly as for a dead microphone.
+        guard !obstructed, !usable.isEmpty else { return }
+
+        // The staleness check wants the loudest instant in the window, so a
+        // brief pause inside busy playback cannot masquerade as silence.
+        checkCalibrationDrift(rawDB: usable.map(\.controlLevelDB).max() ?? usable[0].controlLevelDB)
+
+        // Blunt transients in both directions before they reach the floor
+        // estimate. The speech-likeness score is stored alongside the level it
+        // was measured with, so the Lombard damper can later look at the
+        // character of the readings that actually defined the floor rather than
+        // of whatever happens to be arriving on this tick.
+        for sample in usable {
+            let despikedDB = spikeFilter.ingest(sample.controlLevelDB)
+            ambientTracker.ingest(despikedDB, voiceShare: sample.speechLikeness)
+        }
+
+        let windowSamples = max(EnvoEngine.micSamplesPerSecond * 2,
+                                Int(speedMode.windowSeconds) * EnvoEngine.micSamplesPerSecond)
         guard let floorDB = ambientTracker.floorDB(overLast: windowSamples) else {
             // Not enough history yet. Genuinely nothing to say.
             return
         }
 
-        var ambientDB = floorDB
+        // ── Remove ENVO's own contribution ──
+        // The measured floor includes whatever fraction of our own playback
+        // survives into the quiet moments of the programme material. For speech
+        // that is nearly nothing; for heavily limited music on a speaker it is
+        // nearly everything, and the loop would be partly listening to itself.
+        // The estimator learns that fraction from ENVO's own volume steps, and
+        // reads zero until it has evidence.
+        let deliveredDB = currentDeliveredOffsetDB()
+        deliveredOffsetDB = deliveredDB
+        // Capped well below the SLOW window: a sixty-tick wait is long enough
+        // that a second step almost always interrupts the observation before it
+        // completes, so a shorter, slightly pessimistic reading is worth more
+        // than a perfect one that never arrives.
+        selfCoupling.settleTicks = min(Int(speedMode.windowSeconds), 20)
+        selfCoupling.ingest(floorDB: floorDB, deliveredDB: deliveredDB)
+        let roomDB = selfCoupling.roomLevelDB(fromFloorDB: floorDB, deliveredDB: deliveredDB)
+
+        var ambientDB = roomDB
         if hasBaseline,
            let floorVoiceShare = ambientTracker.voiceShareAtFloor(overLast: windowSamples) {
-            ambientDB = lombardDamper.damp(ambientDB: floorDB,
+            ambientDB = lombardDamper.damp(ambientDB: roomDB,
                                            voiceShare: floorVoiceShare,
                                            baselineDB: baselineAmbientDB)
         }
@@ -499,6 +631,8 @@ final class EnvoEngine: ObservableObject {
             return
         }
 
+        updatePlaybackIdleState()
+
         let noiseDeltaDB = ambientDB - baselineAmbientDB
 
         // ── Control law ──
@@ -512,6 +646,43 @@ final class EnvoEngine: ObservableObject {
         )
 
         applyCurrentOffset()
+    }
+
+    /// What the hardware is actually delivering, in dB relative to the user's
+    /// baseline — the achieved slider position run back through the taper, not
+    /// the offset ENVO asked for. The two differ by up to half a hardware step,
+    /// and the self-coupling estimator is measuring a physical response, so it
+    /// has to be told what physically happened.
+    private func currentDeliveredOffsetDB() -> Float {
+        activeTaper.deliveredDB(forDelta: volumeController.achievedOffset,
+                                atBase: volumeController.baseVolume)
+    }
+
+    /// Track whether anything is actually playing.
+    ///
+    /// With nothing playing there is nothing to keep audible, and moving the
+    /// system volume anyway means the user's next track starts at a level they
+    /// did not choose — possibly in a different app, minutes later, with no
+    /// visible reason. ENVO keeps measuring the room so it is warm when
+    /// playback resumes; it simply stops writing, and hands the level back the
+    /// moment it goes idle.
+    private func updatePlaybackIdleState() {
+        let playing = AVAudioSession.sharedInstance().isOtherAudioPlaying
+        idlePlaybackTicks = playing ? 0 : idlePlaybackTicks + 1
+
+        let idle = idlePlaybackTicks >= playbackIdleConfirmTicks
+        guard idle != isWaitingForPlayback else { return }
+        isWaitingForPlayback = idle
+
+        if idle {
+            // Hand the level back rather than leaving ENVO's offset parked on
+            // the slider for whatever plays next.
+            volumeController.clearOffset()
+            appliedSliderOffset = 0
+            Log.engine.info("Nothing playing; volume handed back, still measuring.")
+        } else {
+            Log.engine.info("Playback resumed; adaptation active again.")
+        }
     }
 
     /// The loop's parameters.
@@ -538,9 +709,15 @@ final class EnvoEngine: ObservableObject {
         )
         currentSliderOffset = sliderOffset
 
+        // Nothing is playing, or this route does not let anyone move its level.
+        // The loop keeps running either way — it is the write that is pointless,
+        // not the measurement — and resumes the moment the condition lifts.
+        guard !isWaitingForPlayback, volumeController.isVolumeControlAvailable else { return }
+
         guard abs(sliderOffset - appliedSliderOffset) >= sliderChangeThreshold else { return }
         appliedSliderOffset = sliderOffset
         volumeController.applyOffset(sliderOffset)
+        deliveredOffsetDB = currentDeliveredOffsetDB()
     }
 
     // MARK: - Calibration Staleness
@@ -617,12 +794,22 @@ final class EnvoEngine: ObservableObject {
 
     /// Adjustment in dB, formatted for the readout — with a sign, and always
     /// alongside a "dB" unit in the UI.
+    ///
+    /// Shows what the hardware **delivered**, not what the control law asked
+    /// for. iOS quantizes the system volume to steps worth roughly 3 dB each,
+    /// so the intent and the result routinely differ by more than a decibel;
+    /// printing the intent meant the app's largest number described a change the
+    /// user could not hear, in either direction.
     var displayOffset: String {
-        let rounded = (currentOffsetDB * 10).rounded() / 10
+        let rounded = (deliveredOffsetDB * 10).rounded() / 10
         if rounded > 0.05 { return String(format: "+%.1f", rounded) }
         if rounded < -0.05 { return String(format: "%.1f", rounded) }
         return "0.0"
     }
+
+    /// How much of the measured floor the estimator currently attributes to
+    /// ENVO's own playback, 0…1. Diagnostic.
+    var selfCouplingEstimate: Float { selfCoupling.coupling }
 
     /// Approximate room level in dB SPL, or nil when not measurable.
     var displayAmbient: Int? {

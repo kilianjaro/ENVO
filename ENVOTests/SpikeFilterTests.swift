@@ -8,7 +8,7 @@ import XCTest
 final class SpikeFilterTests: XCTestCase {
 
     private func filter() -> SpikeFilter {
-        SpikeFilter(windowSize: 12, spikeRatio: 2.5, minimumMargin: 1.0)
+        SpikeFilter(windowSize: 31, spikeRatio: 2.5, minimumMargin: 1.0)
     }
 
     func testSteadySignalPassesThroughUnchanged() {
@@ -47,11 +47,35 @@ final class SpikeFilterTests: XCTestCase {
         XCTAssertEqual(last, -48, accuracy: 0.5)
     }
 
-    /// Only upward spikes are blunted; a sudden drop is real information.
+    /// Downward excursions pass through untouched, and must.
+    ///
+    /// This looks like the wrong asymmetry — `AmbientTracker` reads a low
+    /// percentile, so it is samples arriving *low* that move the floor. But the
+    /// floor is found in the gaps of the programme material, and to a
+    /// median-and-spread rule a speech gap is indistinguishable from a dropout:
+    /// both sit far below a median that is up with the speech. Clipping downward
+    /// would clip the gaps, and ENVO would stop being able to hear the room at
+    /// all. Downward protection lives in `ObstructionDetector` (sustained,
+    /// separated spectrally) and in L90-at-10 Hz plus the control law's time
+    /// constants (brief).
     func testDownwardExcursionPassesThrough() {
         var f = filter()
         for _ in 0..<10 { _ = f.ingest(-50) }
         XCTAssertEqual(f.ingest(-75), -75, accuracy: 0.0001)
+    }
+
+    /// The case that would break if this filter ever became symmetric: speech
+    /// with the room showing through in the gaps, a fifth of the time.
+    func testProgrammeMaterialGapsSurvive() {
+        var f = filter()
+        var lastGap: Float = 0
+        for i in 0..<200 {
+            let level: Float = i % 5 == 0 ? -68 : -35
+            let out = f.ingest(level)
+            if i % 5 == 0 { lastGap = out }
+        }
+        XCTAssertEqual(lastGap, -68, accuracy: 0.0001,
+                       "clipping the gaps would blind the floor estimator")
     }
 
     func testResetClearsWindow() {

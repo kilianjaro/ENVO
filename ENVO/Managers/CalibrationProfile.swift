@@ -33,12 +33,19 @@ struct CalibrationProfile: Codable, Equatable {
     /// numbers are normalized levels, and reading them as dBFS would be
     /// worse than having no profile at all.
     ///
-    /// v3: levels are now A-weighted, so an absolute dBFS figure from v2 is
+    /// v3: levels became A-weighted, so an absolute dBFS figure from v2 is
     /// several dB away from the same room measured today. The derived taper
     /// would survive (it comes from differences at a fixed spectrum) but the
     /// silence floor would not, and a wrong floor means a wrong "recalibrate?"
     /// prompt.
-    static let currentVersion = 3
+    ///
+    /// v4: levels are now the masking-weighted octave-band figure rather than a
+    /// broadband A-weighted one (see `MaskingWeighting`). The change is roughly
+    /// a constant offset for any given spectrum, but only roughly — the whole
+    /// point of the new weighting is that it responds differently to
+    /// low-frequency-dominated rooms — so a v3 silence floor read as a v4 one
+    /// would be wrong by an amount that depends on the room it was measured in.
+    static let currentVersion = 4
 
     var version: Int = CalibrationProfile.currentVersion
 
