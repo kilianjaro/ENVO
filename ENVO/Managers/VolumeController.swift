@@ -61,6 +61,7 @@ final class VolumeController: ObservableObject {
     /// baseline, regardless of what the engine asks for. A last line of
     /// defence independent of the taper, the range setting and the rate
     /// limiter — all of which are also enforced upstream.
+    ///
     static let maxAbsoluteOffset: Float = 0.25
 
     // MARK: - Private
@@ -134,11 +135,28 @@ final class VolumeController: ObservableObject {
     ///
     /// Without this, an intent hovering near a step boundary flips the output
     /// back and forth by a whole step — about 3 dB — every few seconds. A real
-    /// 25-second sample showed three such transitions, which is audible
-    /// pumping produced entirely by quantization rather than by the room.
-    /// Round-to-nearest alone switches at half a step; requiring 0.75 puts a
-    /// quarter-step of dead zone on either side of every boundary.
-    private let stepHysteresis: Float = 0.75
+    /// 25-second sample showed three such transitions, which is audible pumping
+    /// produced entirely by quantization rather than by the room.
+    /// Round-to-nearest alone switches at half a step, which is no protection
+    /// at all; anything above 0.5 buys a dead zone either side of every boundary.
+    ///
+    /// **This is the responsiveness dial, and it is the one to revert first.**
+    /// It sets how much the room has to change before ENVO does anything:
+    ///
+    ///     0.75  →  the room must rise ~5.8 dB before the first step
+    ///     0.60  →  ~4.6 dB, with a 1.5 dB dead zone remaining
+    ///     0.50  →  ~3.8 dB, and no dead zone whatsoever — chatter returns
+    ///
+    /// 0.60 is a deliberate trade: noticeably more willing to act, at the cost
+    /// of a narrower guard than the pumping incident originally called for. It
+    /// is defensible now only because the measurement underneath is far steadier
+    /// than it was then — the floor is an L90 over hundreds of samples rather
+    /// than a percentile over ten — so the intent no longer jitters across
+    /// boundaries on its own.
+    ///
+    /// If a session log shows repeated `volume-step` events alternating up and
+    /// down within a few seconds, that is this constant. Put it back to 0.75.
+    private let stepHysteresis: Float = 0.60
 
     /// Minimum offset change worth applying (avoids constant micro-nudges).
     private let minimumChangeThreshold: Float = 0.004
@@ -280,6 +298,8 @@ final class VolumeController: ObservableObject {
 
         guard bestError < 0.01, abs(best - volumeStep) > 0.0001 else { return }
         Log.volume.info("System volume quantum measured as \(best, format: .fixed(precision: 4)) (was \(self.volumeStep, format: .fixed(precision: 4))).")
+        DiagnosticLog.shared.event("volume-quantum-measured", String(
+            format: "%.4f (was %.4f, from an observed delta of %.4f)", best, volumeStep, magnitude))
         volumeStep = best
     }
 
@@ -332,6 +352,9 @@ final class VolumeController: ObservableObject {
             // quantum, since ENVO's own writes are pre-snapped to the current
             // guess and would only confirm it.
             observeStepFrom(newVolume - previousVolume)
+            DiagnosticLog.shared.event("user-volume-change", String(
+                format: "%.3f -> %.3f (%+.1f steps); baseline re-anchored",
+                previousVolume, newVolume, (newVolume - previousVolume) / volumeStep))
 
             baseVolume = newVolume
             appliedOffset = 0.0
@@ -381,6 +404,13 @@ final class VolumeController: ObservableObject {
         lastEnvoTarget = target
         lastEnvoChangeTime = Date()
 
+        // The single most informative line in a tuning session: every discrete
+        // step the listener could actually hear, with the intent that caused it.
+        DiagnosticLog.shared.event("volume-step", String(
+            format: "%.3f -> %.3f (base %.3f, offset %+.3f, %+.1f steps)",
+            currentSystemVol, target, baseVolume, bounded,
+            (target - currentSystemVol) / volumeStep))
+
         DispatchQueue.main.async { [weak self] in
             self?.volumeSlider?.value = target
             self?.volumeSlider?.sendActions(for: .valueChanged)
@@ -408,6 +438,9 @@ final class VolumeController: ObservableObject {
             self.failedWriteStreak += 1
             if self.failedWriteStreak >= self.failedWriteLimit, self.isVolumeControlAvailable {
                 Log.volume.error("Volume writes are not landing on this route; marking control unavailable.")
+                DiagnosticLog.shared.event("volume-control-unavailable", String(
+                    format: "%d writes did not land; last target %.3f, actual %.3f",
+                    self.failedWriteStreak, target, actual))
                 self.isVolumeControlAvailable = false
             }
         }

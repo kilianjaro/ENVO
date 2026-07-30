@@ -38,9 +38,13 @@ Before that measurement, the signal is split into six **octave bands** — 125 H
 
 The obvious instrument would be an **A-weighting filter**, the correction a sound level meter applies when it reports dB(A). ENVO measures that too, and reports it in the calibration log, because it is the number you can compare against any SPL app. But A-weighting is a *loudness* curve, and it is the wrong tool for a masking problem. It discounts 100 Hz by about 19 dB on the grounds that ears are insensitive there — and then a bus, a train or an aircraft cabin, which are essentially a wall of low-frequency drone, reads as unremarkable while making your podcast completely unintelligible.
 
-The reason is a real psychoacoustic effect called **upward spread of masking**: low-frequency noise doesn't just mask low-frequency content, it raises the threshold of audibility in the bands *above* it. So ENVO takes each band's level, spreads it upward at 12 dB per octave, and combines the result using the octave-band importance weights from ANSI S3.5 — the standard for which frequencies actually carry the information a listener needs. What comes out is a single number that tracks how buried your audio is, not how loud the room feels. A flat room at some level reads exactly that level, and the scale is 1:1 in dB, so every change means what it says.
+The reason is a real psychoacoustic effect called **upward spread of masking**: low-frequency noise doesn't just mask low-frequency content, it raises the threshold of audibility in the bands *above* it. So ENVO takes each band's level, spreads it upward at 12 dB per octave, and combines the result using the octave-band importance weights from ANSI S3.5 — the standard for which frequencies actually carry the information a listener needs. What comes out is a single number that tracks how buried your audio is, not how loud the room feels. A flat room at some level reads exactly that level, and the arithmetic is 1:1 in dB.
 
-A note on the number shown on screen: it is this masking-weighted figure, so it is *not* a dB(A) reading and won't match an SPL app. Converting to an absolute dB SPL figure would require knowing the microphone's exact sensitivity, which iOS does not expose and which varies by device. **The displayed value is an estimate, ±10 dB.** What it reports faithfully is *change* — the scale is 1:1, so a room that gets 10 dB louder moves the reading by 10.
+**A note on the number shown on screen, and an honest limit.** It is this masking-weighted figure, so it is *not* a dB(A) reading and won't match an SPL app. Converting to an absolute dB SPL figure would require knowing the microphone's exact sensitivity, which iOS does not expose and which varies by device. **The displayed value is an estimate, ±10 dB.**
+
+It is also **compressed**, and this is worth stating plainly because it was measured rather than assumed. iOS applies automatic gain control to microphone input — quietly turning the mic down as things get louder — and switching that off requires a session mode that also bypasses the *output* processing chain for the whole device, making every app's playback quieter. For an app whose entire job is managing how loud music is, that trade is not available at any price. So the AGC stays.
+
+The cost, measured on an iPhone 14 against a calibrated sound level meter: a room change verified at 20 dB read as **15.6 dB**. A slope of 0.78, identical going up and coming down, returning to within 0.1 dB. ENVO is tuned to account for it — the control gain is raised to suit — but the consequence is that ENVO's decibels are approximate, not exact. It adapts *usefully*, not *accurately*, and on this hardware that is the only honest option.
 
 ### 2. Thinking in decibels, not slider-percent
 
@@ -55,7 +59,18 @@ ENVO reasons entirely in dB — the language your ear speaks — and converts th
 
 The payoff either way: **"+3 dB" feels like the same amount of "louder" whether you started quiet or loud** — and it never quietly becomes +8.
 
-The **RANGE** control is a hard ceiling on this intent, not a sensitivity dial: ±3 dB (gentle), ±6 dB (balanced), or ±9 dB (assertive). ENVO will never push more than that far from your baseline, in either direction. How *strongly* it reacts is a separate, fixed constant (it applies about 0.4 dB of volume change per dB of room change) — so widening the range gives you more headroom without also making ENVO twitchier.
+The **RANGE** control is a hard ceiling on this intent, not a sensitivity dial: ±3, ±6 or ±9 dB. ENVO will never push more than that far from your baseline, in either direction. How *strongly* it reacts is a separate, fixed constant — about 0.5 dB of volume change per dB of room change, which after the microphone's compression works out near 0.4 in practice — so widening the range gives you more headroom without also making ENVO twitchier.
+
+**What that adds up to in practice**, and it is coarser than the decibels above suggest, because iOS only lets an app move the system volume in fixed steps of roughly 3 dB:
+
+| The room gets louder by | ENVO does |
+|---|---|
+| under ~5 dB | nothing |
+| ~5 dB | one step, +3 dB |
+| ~12 dB | two steps, +6 dB |
+| ~20 dB | three steps, +9 dB |
+
+An office filling up after lunch is about 8 dB. A quiet home to a busy café is about 25. So in daily use you would see one or two steps, occasionally three. Coming back down works the same way, with a deliberate dead zone in between so the volume cannot flutter between two steps.
 
 ### 3. The feedback trap — finding the room underneath your own music
 
@@ -69,7 +84,25 @@ A percentile is only as good as the number of readings behind it, which is why E
 
 **But there is an honest limit here, and ENVO handles it explicitly.** The gaps trick works beautifully for speech — a podcast drops to the room level between sentences. It works far less well for dense modern music played on a speaker: a mastered pop track has a loudness range of three to eight decibels, so there are no real gaps, and the floor lands a few dB under *the music* rather than on the room. Then the loop is partly listening to itself: ENVO turns up, the floor it measures rises with it, and it reads its own output as the room getting louder. It still converges — the loop gain stays well under 1 and the range cap bounds it absolutely — but the effective gain climbs from the 0.4 it was tuned for to about 0.67.
 
-So ENVO measures that coupling and removes it (`SelfCouplingEstimator`). It knows exactly when it moved the volume and by exactly how many decibels, which makes its own adjustment a probe signal: step the output by a known amount, watch what the measured floor does, and the ratio is how much of the floor is the device rather than the room. On headphones it settles at ~0 and nothing is subtracted; on a speaker playing dense music it approaches 1 and the device's whole contribution comes back out. Because ENVO steps rarely by design, this is backed by a starting estimate derived from the output route — the built-in speaker is a few centimetres from the microphone and certainly couples; sealed headphones certainly don't — which a completed measurement then overrides.
+So ENVO measures that coupling and removes what it can (`SelfCouplingEstimator`). It knows exactly when it moved the volume and by exactly how many decibels, which makes its own adjustment a probe signal: step the output by a known amount, watch what the measured floor does, and the ratio is how much of the floor is the device rather than the room. On headphones it settles near 0 and nothing is subtracted; on a speaker it climbs, and the device's added contribution comes back out. This is backed by a starting estimate derived from the output route — the built-in speaker is a few centimetres from the microphone and certainly couples, sealed headphones certainly don't — which a completed measurement then overrides.
+
+#### The wall this eventually hits, stated plainly
+
+There is a limit here that no amount of cleverness gets past, and it was measured on a real device rather than reasoned about.
+
+The probe above can only subtract the music **ENVO itself added** — the amount above the volume *you* chose. It has no way to remove the music you were already playing when you pressed START. And on iOS it never will: subtracting your music would require access to the audio another app is playing, and the system does not hand that to anyone.
+
+So when continuous music plays out loud, loudly enough to be the loudest thing in the room, it sets a floor that ENVO cannot see beneath. A test bears this out exactly: with the same track at the same volume, the room was dropped by 22 dB and ENVO's measured floor moved **0.4 dB**. It had stopped listening to the room and was listening to the music.
+
+What that means in practice:
+
+| Listening through | Adapting downward |
+|---|---|
+| **Headphones** | Full range. The microphone cannot hear your music at all. |
+| **Speech — podcasts, audiobooks — out loud** | Works. The gaps between sentences genuinely reach the room. |
+| **Continuous music out loud** | Returns you to your starting volume, but cannot go below it. |
+
+Worth noting which way this fails. When your music is the loudest thing in the room, you do not need it turned down in order to *hear* it — the gap is already enormous. Failing to reduce is a comfort miss, not an audibility one, and ENVO still restores your baseline correctly. It is the least harmful of the available failures, which is why the design accepts it rather than papering over it.
 
 **So what is calibration for?** Two things, both real:
 
@@ -134,7 +167,7 @@ This is the part that got the most engineering attention, because a volume contr
 6. **Mean-reverting by design.** When the room quiets down, the offset melts back toward zero on its own, and lands exactly on zero rather than hovering near it. ENVO's natural resting state is "do nothing."
 7. **Lombard-proofed.** As described above, the speech-share damper prevents the slow social feedback spiral from translating into a slow creep on your volume over a long session.
 8. **Transient-proofed.** Spikes can't trigger jumps.
-9. **Feedback-proofed, and measurably so.** The noise floor is measured at the quiet moments of your own program material, so ENVO's own output mostly stays out of it — and where it doesn't, ENVO measures how much gets in and subtracts it. The loop gain is far below 1 either way: it converges by construction, not by luck.
+9. **Feedback-proofed.** The noise floor is measured at the quiet moments of your own program material, so ENVO's own output mostly stays out of it — and where it doesn't, ENVO measures how much of its *own added volume* gets in and subtracts that. The loop gain is far below 1 either way: it converges by construction, not by luck. What it cannot subtract is the music you were already playing when you pressed START — see the limit described in section 3.
 10. **Never steers blind.** If the microphone stops delivering audio — an interruption, a media-services reset, a failed engine start — ENVO *holds* its current adjustment and works on reviving the mic, backing off between attempts rather than hammering the audio system. It never acts on a frozen reading.
 10a. **Knows when it can't measure, and says so.** A covered microphone (pocket, bag, face-down) and an input at full scale both produce readings that aren't measurements of the room. ENVO detects both, holds its adjustment, and tells you in plain language rather than acting on the number. A covered mic is caught spectrally — covering a microphone is a low-pass, and a room that merely went quiet keeps its shape.
 10b. **Doesn't touch the volume when nothing is playing.** ENVO hands the level straight back the moment playback stops, so your next track never starts at a level you didn't choose. It keeps reading the room so it's ready when you press play.
@@ -161,7 +194,9 @@ Guards 1–4 and 6 are proven by property tests that sweep every base volume aga
 
 **Cooking with a podcast.** Extractor fan on, tap running, pan sizzling, then sudden quiet. Your hands are covered in flour. ENVO is the sous-chef that manages the volume so you don't have to.
 
-**Restaurants & bars (solving the space, not just the listener).** On a call in a bar that's filling up? ENVO keeps your caller audible without you joining the shouting match — and because it's Lombard-aware, it won't mistake the rising hubbub for a reason to keep climbing. When the group leaves and the room suddenly hushes, ENVO catches the drop and eases you down *before* you become the person whose phone is audible three tables over. That "sudden-silence blast" — the library moment — is precisely the public-space acoustics problem ENVO is built to prevent.
+**Restaurants & bars.** On a call in a bar that's filling up? ENVO keeps your caller audible without you joining the shouting match — and because it's Lombard-aware, it won't mistake the rising hubbub for a reason to keep climbing. When the group leaves and the room hushes, ENVO eases you back down to where you started.
+
+One caveat, measured rather than guessed: how far *below* your starting point it can go depends on what you're listening through. On headphones, or with speech content, the full downward range is available. Playing continuous music out loud, ENVO returns you to your baseline but cannot go below it — see section 3 for why.
 
 ---
 
@@ -248,7 +283,7 @@ ENVO is a compact SwiftUI + Combine app with a clean separation between the pure
 | `BackgroundAudioHandler` | Silent looping player for background survival. |
 | `NowPlayingController` / `EnvoIntents` | Lock-screen tile and Siri/Shortcuts surface. |
 
-**Testing.** The safety-critical logic lives in pure, deterministic types — `AcousticMath`, `AmbientTracker`, `ControlLaw`, `LombardDamper`, `VolumeTaper`, `SpikeFilter`, `CalibrationProfile`, `MaskingWeighting`, `ModulationDetector`, `SelfCouplingEstimator`, `ObstructionDetector` — plus `AWeightingFilter` and `OctaveBandAnalyzer` — so the guarantees can be verified in isolation. 160 tests cover them, including property tests that sweep the full parameter space for bound violations, an end-to-end simulation that runs the real tracker, spike filter and control law over a changing room at the rates the engine actually uses, a closed-loop simulation with the hardware quantizer in it, and checks of the A-weighting and filterbank responses against their reference tables.
+**Testing.** The safety-critical logic lives in pure, deterministic types — `AcousticMath`, `AmbientTracker`, `ControlLaw`, `LombardDamper`, `VolumeTaper`, `SpikeFilter`, `CalibrationProfile`, `MaskingWeighting`, `ModulationDetector`, `SelfCouplingEstimator`, `ObstructionDetector` — plus `AWeightingFilter` and `OctaveBandAnalyzer` — so the guarantees can be verified in isolation. 162 tests cover them, including property tests that sweep the full parameter space for bound violations, an end-to-end simulation that runs the real tracker, spike filter and control law over a changing room at the rates the engine actually uses, a closed-loop simulation with the hardware quantizer in it, and checks of the A-weighting and filterbank responses against their reference tables.
 
 This structure is deliberate: an earlier version proved its safety properties with a hand-written simulation that *re-implemented* the control loop, which meant it could only ever prove things about itself. The tests now drive the shipping code.
 

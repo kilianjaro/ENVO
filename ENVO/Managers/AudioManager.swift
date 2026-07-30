@@ -21,8 +21,18 @@ struct AmbientSample: Equatable {
     let aWeightedLevelDB: Float
     /// 0…1 estimate of how speech-like the room is right now.
     let speechLikeness: Float
+    /// The spectral half of that score, on its own. Diagnostic: when the damper
+    /// behaves unexpectedly, the first question is always which of the two
+    /// measurements moved.
+    let spectralSpeechScore: Float
+    /// The temporal half, as raw modulation depth in dB rather than a score, so
+    /// the ramp constants can be retuned against real rooms.
+    let modulationDepthDB: Float
     /// Share of band energy above 1 kHz. Feeds obstruction detection.
     let highFrequencyShare: Float
+    /// Octave-band levels in dBFS, low to high, energy-averaged over this
+    /// sample's interval. Diagnostic only.
+    let bandLevelsDB: [Float]
     /// The input hit full scale during this interval, so the level is a floor
     /// on the truth rather than the truth.
     let isClipping: Bool
@@ -60,7 +70,21 @@ private final class LevelProcessor {
     var seeded = false
 
     var speechLikeness: Float = 0
+    var spectralSpeechScore: Float = 0
     var highFrequencyShare: Float = 0
+
+    /// Band **power** accumulated across the publish interval, and the buffer
+    /// count behind it.
+    ///
+    /// The band columns used to be an instantaneous snapshot of whichever buffer
+    /// happened to be last before a publish. A device log caught the failure
+    /// exactly: one tick reported every band 26 dB below its neighbours while the
+    /// smoothed control level barely moved, because a single near-silent 21 ms
+    /// buffer landed on the sampling instant. Averaging the power over the whole
+    /// interval makes the bands an Leq like every other level in the row, and
+    /// makes the spectral ratios derived from them steady rather than jittery.
+    var bandPowerAccum = [Float](repeating: 0, count: OctaveBandAnalyzer.centerFrequencies.count)
+    var bandAccumCount = 0
 
     /// Sticky within a publish interval: one clipped buffer taints the whole
     /// reading, and a peak that just touched full scale is usually accompanied
@@ -120,6 +144,11 @@ final class AudioManager: ObservableObject {
     /// `ModulationDetector`.
     @Published private(set) var speechLikeness: Float = 0.0
 
+    /// Most recent octave-band levels in dBFS, low to high. Diagnostic only —
+    /// nothing steers on it, but it is what makes the masking weighting and the
+    /// obstruction detector checkable against a real room rather than trusted.
+    @Published private(set) var latestBandLevelsDB: [Float] = []
+
     /// True when the input recently hit full scale. An iPhone microphone clips
     /// somewhere around 105–110 dB SPL, and past that point the reading
     /// compresses and stops tracking the room — exactly where a volume
@@ -167,19 +196,21 @@ final class AudioManager: ObservableObject {
     /// calibration**, and the displayed number should be read as
     /// "approximately", ±10 dB.
     ///
-    /// It is offset from `aWeightedFullScaleSPL` below by the band-splitting
-    /// difference described on `displayFloorDB`, plus a couple of dB for the
-    /// bandpass cascade's narrowed passband. Both are constant offsets, so what
-    /// the readout can be trusted for is *change*: it is 1:1 in dB, and a room
-    /// that gets 10 dB louder moves the number by 10.
+    /// **Measured on device**, not derived: an iPhone 14 reading rooms verified
+    /// at 60 / 70 / 80 dB(A) on a sound level meter implied offsets of 103.3,
+    /// 106.6 and 107.6. The value is not constant because iOS compresses the
+    /// input scale (see `EnvoEngine.compensationGain`), so the figure below is
+    /// chosen to be right in the middle of the range people actually listen in
+    /// — roughly 55–75 dB(A) — and reads a few dB low in very loud rooms.
     ///
-    /// TODO: verify on device against a reference sound level meter. Only this
-    /// one constant needs to move to make the absolute figure right.
-    static let fullScaleSPL: Float = 117.0
+    /// Was 117.0, a reasoned guess, which put every reading about 12 dB high.
+    static let fullScaleSPL: Float = 105.0
 
     /// Same idea for the A-weighted diagnostic level, which unlike the control
-    /// level *is* directly comparable to any dB(A) meter.
-    static let aWeightedFullScaleSPL: Float = 105.0
+    /// level *is* directly comparable to any dB(A) meter. Same device
+    /// measurement: implied offsets of 96.7, 99.9 and 101.1 at 60 / 70 / 80
+    /// dB(A). Was 105.0.
+    static let aWeightedFullScaleSPL: Float = 98.0
 
     /// Audio-thread-only. Gates the main-thread @Published writes to
     /// ~10 Hz — the rate the engine samples at, and plenty for the 30 fps
@@ -469,10 +500,15 @@ final class AudioManager: ObservableObject {
         p.bands.analyze(samples, count: frameLength)
         let controlDB = MaskingWeighting.maskingLevelDB(p.bands.bandLevelsDB,
                                                         activeBandCount: p.bands.activeBandCount)
-        let spectralSpeech = MaskingWeighting.speechBandShare(p.bands.bandLevelsDB,
-                                                              activeBandCount: p.bands.activeBandCount)
-        let highShare = MaskingWeighting.highFrequencyShare(p.bands.bandLevelsDB,
-                                                            activeBandCount: p.bands.activeBandCount)
+
+        // The control level stays per-buffer, because the 125 ms Fast weighting
+        // below is the thing that integrates it. The spectral descriptors do not:
+        // they are ratios, and a ratio of one 21 ms frame is needlessly noisy, so
+        // the power is accumulated and they are derived once per publish.
+        for i in 0..<p.bands.activeBandCount {
+            p.bandPowerAccum[i] += AcousticMath.power(fromDB: p.bands.bandLevelsDB[i])
+        }
+        p.bandAccumCount += 1
 
         // ── A-weighted broadband: the diagnostic ──
         // Accumulated in place rather than filtered into a scratch buffer, so
@@ -520,19 +556,7 @@ final class AudioManager: ObservableObject {
         // statistical scatter; `ModulationDetector`'s floor is set for that.
         p.modulation.ingest(levelDB: controlDB, dt: dt)
 
-        // Averaged rather than multiplied, because the two measurements fail in
-        // opposite situations and neither should be able to veto the other.
-        // Many-talker babble averages toward steady noise and loses its
-        // modulation, but keeps its speech-shaped spectrum; a broadband hiss in
-        // a room with no low end reads spectrally speech-like but does not
-        // modulate. Requiring both would miss the first; accepting either would
-        // fire on the second.
-        p.speechLikeness = AcousticMath.clamp(
-            0.5 * spectralSpeechScore(spectralSpeech) + 0.5 * p.modulation.score, 0, 1
-        )
-        p.highFrequencyShare = highShare
-
-        // Smoothing state above updates on every buffer; only the
+        // Smoothing and modulation state above update on every buffer; only the
         // main-thread publish is rate-limited.
         let now = CFAbsoluteTimeGetCurrent()
         let elapsed = now - p.lastPublish
@@ -540,11 +564,43 @@ final class AudioManager: ObservableObject {
         let interval = p.lastPublish > 0 ? Float(elapsed) : Float(publishInterval)
         p.lastPublish = now
 
+        // ── Derive the spectral descriptors from the interval's mean power ──
+        var meanBands = [Float](repeating: AcousticMath.silenceDB,
+                                count: OctaveBandAnalyzer.centerFrequencies.count)
+        if p.bandAccumCount > 0 {
+            let n = Float(p.bandAccumCount)
+            for i in 0..<p.bands.activeBandCount {
+                meanBands[i] = AcousticMath.dB(fromPower: p.bandPowerAccum[i] / n)
+            }
+        }
+        for i in 0..<p.bandPowerAccum.count { p.bandPowerAccum[i] = 0 }
+        p.bandAccumCount = 0
+
+        p.spectralSpeechScore = spectralSpeechScore(
+            MaskingWeighting.speechBandShare(meanBands, activeBandCount: p.bands.activeBandCount)
+        )
+        p.highFrequencyShare = MaskingWeighting.highFrequencyShare(
+            meanBands, activeBandCount: p.bands.activeBandCount
+        )
+        // Averaged rather than multiplied, because the two measurements fail in
+        // opposite situations and neither should be able to veto the other.
+        // Many-talker babble averages toward steady noise and loses its
+        // modulation but keeps its speech-shaped spectrum; a broadband hiss in a
+        // room with no low end reads spectrally speech-like but does not
+        // modulate. Requiring both would miss the first; accepting either would
+        // fire on the second.
+        p.speechLikeness = AcousticMath.clamp(
+            0.5 * p.spectralSpeechScore + 0.5 * p.modulation.score, 0, 1
+        )
+
         let sample = AmbientSample(
             controlLevelDB: p.smoothedControlDB,
             aWeightedLevelDB: p.smoothedAWeightedDB,
             speechLikeness: p.speechLikeness,
+            spectralSpeechScore: p.spectralSpeechScore,
+            modulationDepthDB: p.modulation.depthDB,
             highFrequencyShare: p.highFrequencyShare,
+            bandLevelsDB: meanBands,
             isClipping: p.sawClipping,
             dt: interval
         )
@@ -562,6 +618,7 @@ final class AudioManager: ObservableObject {
             self.normalizedLevel = normalized
             self.speechLikeness = sample.speechLikeness
             self.isClipping = sample.isClipping
+            self.latestBandLevelsDB = sample.bandLevelsDB
 
             self.pendingSamples.append(sample)
             if self.pendingSamples.count > self.maxPendingSamples {
@@ -572,11 +629,38 @@ final class AudioManager: ObservableObject {
 
     /// Maps the 250 Hz–2 kHz energy share onto 0…1.
     ///
-    /// Traffic, ventilation and engine noise land around 0.1–0.2 because their
-    /// energy is dominated by 125 Hz and below. Speech babble peaks near 500 Hz
-    /// and lands around 0.5–0.6. The ramp brackets the gap between them.
+    /// CALIBRATED AGAINST MEASURED DEVICE DATA, NOT GUESSES
+    /// ----------------------------------------------------
+    /// The first version of this ramp ran 0.25 → 0.55, on the reasoning that
+    /// traffic sits near 0.1–0.2 and babble near 0.5–0.6. The traffic figure was
+    /// right; the babble figure was badly wrong, and so was the assumption about
+    /// where *neutral* noise sits.
+    ///
+    /// A device log settled it. Broadband pink noise, measured on an iPhone 14
+    /// through its own microphone, produces a share of **0.55–0.61** — because
+    /// four of the six bands are in the numerator, so any broadband signal starts
+    /// over half way up. The old ramp therefore pinned plain pink noise at a
+    /// score of **1.00**, which combined with a modulation score of ~0 to put
+    /// `speechLikeness` at 0.46 — just past `LombardDamper.engageShare` of 0.45.
+    /// ENVO was quietly damping its response to ordinary broadband noise.
+    ///
+    /// Anchors now in use, from real measurement where available:
+    ///
+    ///     traffic / ventilation      0.10   (synthetic, LF-dominated)
+    ///     broadband pink, measured   0.55 – 0.61
+    ///     speech babble              0.90 – 0.98
+    ///
+    /// So the ramp brackets the gap between neutral and speech-shaped, not
+    /// between LF-dominated and neutral.
+    ///
+    /// The upper anchor is still the weaker of the two — it comes from a
+    /// speech-shaped synthetic rather than a room full of people. S2 in
+    /// TESTING.md measures it directly. If real babble lands nearer 0.70 than
+    /// 0.90 this ramp wants lowering, and note the failure direction is safe
+    /// either way: the modulation half of the score carries the detection on its
+    /// own, which is exactly why the two are averaged rather than multiplied.
     private func spectralSpeechScore(_ share: Float) -> Float {
-        AcousticMath.clamp((share - 0.25) / (0.55 - 0.25), 0, 1)
+        AcousticMath.clamp((share - 0.65) / (0.90 - 0.65), 0, 1)
     }
 
     // MARK: - Display

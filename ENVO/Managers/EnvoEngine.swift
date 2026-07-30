@@ -147,7 +147,30 @@ final class EnvoEngine: ObservableObject {
     /// no longer a reason for the loop to behave differently — what
     /// calibration buys is dB *accuracy* via the measured taper, plus gap and
     /// staleness reporting.
-    private let compensationGain: Float = 0.40
+    ///
+    /// WHY 0.50 RATHER THAN THE 0.40 THIS IS TUNED FOR
+    /// ------------------------------------------------
+    /// Because the microphone under-hears, and this is the one place it can be
+    /// paid for without side effects.
+    ///
+    /// iOS applies automatic gain control to the input unless the session runs
+    /// in `.measurement` mode, and `.measurement` bypasses the *output*
+    /// processing chain for the whole route — every app's playback gets quieter
+    /// while ENVO holds the session, which is unacceptable in a volume app. So
+    /// the AGC stays, and with it a measured compression of the decibel scale:
+    /// on an iPhone 14, a room change verified at 20 dB on a sound level meter
+    /// read as 15.6 dB at the tap. A slope of 0.78, the same ascending and
+    /// descending, returning to within 0.09 dB.
+    ///
+    /// 0.40 applied to a signal that is 78% of the truth is an effective 0.31 dB
+    /// per real dB — the loop was a fifth more timid than designed, everywhere.
+    /// 0.50 × 0.78 restores it to 0.39, which is what the tuning intended.
+    ///
+    /// This is a correction for measured end-to-end behaviour, not a claim about
+    /// the cause. If a future iOS stops compressing, the effective gain becomes
+    /// 0.50 — still inside the 0.3–0.5 range established for automotive and
+    /// hearing-aid volume compensation, so erring this way is safe.
+    private let compensationGain: Float = 0.50
 
     /// Smoothing retention on the dB intent, per 1 Hz tick.
     private let offsetSmoothing: Float = 0.85
@@ -195,6 +218,10 @@ final class EnvoEngine: ObservableObject {
     /// `SelfCouplingEstimator` — without it the loop partly steers on its own
     /// output whenever dense music is playing through a speaker.
     private var selfCoupling = SelfCouplingEstimator()
+
+    /// `deliveredOffsetDB`, lagged to match how slowly the measured floor
+    /// responds to it. See `laggedDeliveredDB`.
+    private var smoothedDeliveredDB: Float = 0
 
     /// Spots a covered microphone, which a low percentile follows straight down.
     private var obstructionDetector = ObstructionDetector()
@@ -357,6 +384,7 @@ final class EnvoEngine: ObservableObject {
             RunLoop.main.add(t, forMode: .common)
         }
 
+        DiagnosticLog.shared.startSession(engine: self)
         isActive = true
         Log.engine.info("ENVO started. Taper span \(self.activeTaper.spanDB, format: .fixed(precision: 1)) dB, calibrated=\(self.isCalibrated).")
     }
@@ -375,6 +403,7 @@ final class EnvoEngine: ObservableObject {
         BackgroundAudioHandler.shared.disableBackgroundAudio()
         AudioSessionController.shared.release(.engine)
 
+        DiagnosticLog.shared.endSession(reason: "user stopped")
         resetControlState()
         isActive = false
         levelHistory = []
@@ -396,6 +425,7 @@ final class EnvoEngine: ObservableObject {
         currentSliderOffset = 0
         appliedSliderOffset = 0
         deliveredOffsetDB = 0
+        smoothedDeliveredDB = 0
         staleStreak = 0
         deadMicTicks = 0
         revivalBackoffTicks = 1
@@ -447,6 +477,9 @@ final class EnvoEngine: ObservableObject {
         selfCoupling.reset()
         selfCoupling.prior = AudioSessionController.shared.selfCouplingPrior
         obstructionDetector.reset()
+        DiagnosticLog.shared.event("route-change",
+            "now \(AudioSessionController.shared.currentOutputName), coupling prior reset to "
+            + String(format: "%.2f", AudioSessionController.shared.selfCouplingPrior))
     }
 
     /// Drop the adjustment and re-measure the room from here.
@@ -455,6 +488,7 @@ final class EnvoEngine: ObservableObject {
         currentSliderOffset = 0
         appliedSliderOffset = 0
         deliveredOffsetDB = 0
+        smoothedDeliveredDB = 0
         hasBaseline = false
         warmupTicks = 0
         ambientTracker.reset()
@@ -464,6 +498,7 @@ final class EnvoEngine: ObservableObject {
         // anything, which would look like a probe it never made.
         selfCoupling.discardObservationInProgress()
         Log.engine.info("Re-anchoring (\(reason, privacy: .public)): adjustment zeroed, baseline re-measuring.")
+        DiagnosticLog.shared.event("re-anchor", reason)
     }
 
     private func registerRouteObserver() {
@@ -554,6 +589,8 @@ final class EnvoEngine: ObservableObject {
         if obstructed != isMicrophoneObstructed {
             isMicrophoneObstructed = obstructed
             Log.engine.info("Microphone obstruction \(obstructed ? "detected" : "cleared", privacy: .public); adjustment \(obstructed ? "held" : "resumed", privacy: .public).")
+            DiagnosticLog.shared.event(obstructed ? "obstruction-detected" : "obstruction-cleared",
+                String(format: "hf_share=%.3f level=%.1f", samples.last?.highFrequencyShare ?? -1, samples.last?.controlLevelDB ?? 0))
         }
 
         // A clipped reading is compressed rather than wrong-by-an-offset: past
@@ -561,7 +598,12 @@ final class EnvoEngine: ObservableObject {
         // readings are kept out of the floor entirely rather than being fed in
         // as an underestimate.
         let usable = samples.filter { !$0.isClipping }
-        isInputClipping = usable.count < samples.count
+        let clippingNow = usable.count < samples.count
+        if clippingNow != isInputClipping {
+            DiagnosticLog.shared.event(clippingNow ? "clipping-began" : "clipping-ended",
+                                       "\(samples.count - usable.count)/\(samples.count) samples")
+        }
+        isInputClipping = clippingNow
 
         // Both conditions mean the same thing: the number arriving is not a
         // measurement of the room. Hold, exactly as for a dead microphone.
@@ -602,8 +644,32 @@ final class EnvoEngine: ObservableObject {
         // completes, so a shorter, slightly pessimistic reading is worth more
         // than a perfect one that never arrives.
         selfCoupling.settleTicks = min(Int(speedMode.windowSeconds), 20)
+        let observationsBefore = selfCoupling.observationCount
         selfCoupling.ingest(floorDB: floorDB, deliveredDB: deliveredDB)
-        let roomDB = selfCoupling.roomLevelDB(fromFloorDB: floorDB, deliveredDB: deliveredDB)
+
+        // Lag the delivered offset before subtracting it.
+        //
+        // The correction removes the share of the floor that is ENVO's own
+        // playback — but the floor is a percentile over the response window, so
+        // it takes about a full window to absorb a volume step. Subtracting the
+        // step the instant it happens takes out a contribution the floor has not
+        // picked up yet, which reads as the room suddenly going quiet and
+        // invites ENVO to step straight back down. Delaying the correction by
+        // the same amount the floor lags keeps the two in step.
+        let lag = expf(-Float(sampleInterval) / Float(speedMode.windowSeconds))
+        smoothedDeliveredDB = lag * smoothedDeliveredDB + (1 - lag) * deliveredDB
+        if selfCoupling.observationCount > observationsBefore, let o = selfCoupling.lastObservation {
+            // Whether this ever fires in real use is the open question about the
+            // estimator. A session with no such line ran entirely on the route
+            // prior — which is expected, not broken, but worth knowing.
+            DiagnosticLog.shared.event("coupling-observed", String(
+                format: "step=%.2f dB  pre=%.1f  post=%.1f  raw=%.3f  accepted=%.3f  estimate %@ -> %.3f",
+                o.stepDB, o.preFloorDB, o.postFloorDB, o.raw, o.accepted,
+                o.previousEstimate.map { String(format: "%.3f", $0) } ?? "prior",
+                o.newEstimate))
+        }
+        let roomDB = selfCoupling.roomLevelDB(fromFloorDB: floorDB,
+                                              deliveredDB: smoothedDeliveredDB)
 
         var ambientDB = roomDB
         if hasBaseline,
@@ -627,6 +693,8 @@ final class EnvoEngine: ObservableObject {
                 baselineAmbientDB = ambientDB
                 hasBaseline = true
                 Log.engine.info("Baseline anchored at \(self.baselineAmbientDB, format: .fixed(precision: 1)) dBFS.")
+                DiagnosticLog.shared.event("baseline-anchored",
+                    String(format: "%.1f dBFS after %d ticks", baselineAmbientDB, warmupCount))
             }
             return
         }
@@ -646,6 +714,64 @@ final class EnvoEngine: ObservableObject {
         )
 
         applyCurrentOffset()
+
+        recordDiagnostics(samples: usable,
+                          floorDB: floorDB,
+                          deliveredDB: deliveredDB,
+                          roomDB: roomDB,
+                          dampedDB: ambientDB,
+                          noiseDeltaDB: noiseDeltaDB,
+                          windowSamples: windowSamples)
+    }
+
+    /// Emit one row describing this tick. Every intermediate value the loop
+    /// computed, so a session can be reconstructed against what the listener
+    /// reported hearing — which is the only way to tell "the constant is wrong"
+    /// apart from "the mechanism is wrong".
+    private func recordDiagnostics(samples: [AmbientSample],
+                                   floorDB: Float,
+                                   deliveredDB: Float,
+                                   roomDB: Float,
+                                   dampedDB: Float,
+                                   noiseDeltaDB: Float,
+                                   windowSamples: Int) {
+        guard DiagnosticLog.shared.isEnabled, !samples.isEmpty else { return }
+        let n = Float(samples.count)
+
+        DiagnosticLog.shared.tick(DiagnosticTick(
+            // Energy-averaged over the tick, so the row is an Leq for that
+            // second rather than whichever sample happened to be last.
+            controlLevelDB: AcousticMath.meanDB(samples.map(\.controlLevelDB)),
+            aWeightedLevelDB: AcousticMath.meanDB(samples.map(\.aWeightedLevelDB)),
+            // Energy-averaged across the tick, like the levels above, so the band
+            // columns are an Leq for the second rather than whichever 21 ms
+            // buffer happened to land on the sampling instant.
+            bandLevelsDB: (0..<OctaveBandAnalyzer.centerFrequencies.count).map { band in
+                AcousticMath.meanDB(samples.compactMap {
+                    band < $0.bandLevelsDB.count ? $0.bandLevelsDB[band] : nil
+                })
+            },
+            floorDB: floorDB,
+            coupling: selfCoupling.coupling,
+            couplingIsMeasured: selfCoupling.isMeasured,
+            deliveredDB: deliveredDB,
+            roomDB: roomDB,
+            dampedRoomDB: dampedDB,
+            baselineDB: baselineAmbientDB,
+            noiseDeltaDB: noiseDeltaDB,
+            speechAtFloor: ambientTracker.voiceShareAtFloor(overLast: windowSamples) ?? -1,
+            spectralScore: samples.map(\.spectralSpeechScore).reduce(0, +) / n,
+            modulationDepthDB: samples.map(\.modulationDepthDB).reduce(0, +) / n,
+            offsetIntentDB: currentOffsetDB,
+            baseVolume: volumeController.baseVolume,
+            systemVolume: AVAudioSession.sharedInstance().outputVolume,
+            sliderOffset: currentSliderOffset,
+            obstructed: isMicrophoneObstructed,
+            clipping: isInputClipping,
+            playbackIdle: isWaitingForPlayback,
+            speed: speedMode.rawValue,
+            rangeDB: rangeMode.maxOffsetDB
+        ))
     }
 
     /// What the hardware is actually delivering, in dB relative to the user's
@@ -680,8 +806,10 @@ final class EnvoEngine: ObservableObject {
             volumeController.clearOffset()
             appliedSliderOffset = 0
             Log.engine.info("Nothing playing; volume handed back, still measuring.")
+            DiagnosticLog.shared.event("playback-idle", "volume handed back")
         } else {
             Log.engine.info("Playback resumed; adaptation active again.")
+            DiagnosticLog.shared.event("playback-resumed")
         }
     }
 
@@ -795,13 +923,20 @@ final class EnvoEngine: ObservableObject {
     /// Adjustment in dB, formatted for the readout — with a sign, and always
     /// alongside a "dB" unit in the UI.
     ///
-    /// Shows what the hardware **delivered**, not what the control law asked
-    /// for. iOS quantizes the system volume to steps worth roughly 3 dB each,
-    /// so the intent and the result routinely differ by more than a decibel;
-    /// printing the intent meant the app's largest number described a change the
-    /// user could not hear, in either direction.
+    /// Shows the control law's **intent**, not what the hardware delivered.
+    ///
+    /// These differ, and knowingly so. iOS quantizes the system volume to steps
+    /// worth roughly 3 dB, so the output is only ever at 0, ±3, ±6 or ±9 while
+    /// this number moves continuously through the values in between. Showing the
+    /// delivered amount instead would be the literal truth about the speaker and
+    /// a much worse readout: it would sit at 0.0 for a minute and then jump, and
+    /// tell the user nothing about whether ENVO was doing anything.
+    ///
+    /// The continuous value is what makes the app legible — you can watch it
+    /// climb toward the next step and see the engine working. `deliveredOffsetDB`
+    /// remains available for the diagnostic log, where literal truth is the point.
     var displayOffset: String {
-        let rounded = (deliveredOffsetDB * 10).rounded() / 10
+        let rounded = (currentOffsetDB * 10).rounded() / 10
         if rounded > 0.05 { return String(format: "+%.1f", rounded) }
         if rounded < -0.05 { return String(format: "%.1f", rounded) }
         return "0.0"

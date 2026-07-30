@@ -4,3 +4,7 @@ xcuserdata/
 *.xcuserstate
 build/
 DerivedData/
+TestSignals/
+APP_STORE.md
+TESTS/
+Tools/

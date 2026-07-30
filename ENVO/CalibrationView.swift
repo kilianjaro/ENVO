@@ -122,6 +122,11 @@ struct CalibrationView: View {
                     .font(.envo(size: 11))
                     .foregroundColor(.gray)
                     .lineSpacing(4)
+
+                Text("CLEAR CALIBRATION discards the saved profile and returns ENVO to its default assumed volume curve, as if it had never been calibrated.")
+                    .font(.envo(size: 11))
+                    .foregroundColor(.gray)
+                    .lineSpacing(4)
             }
         }
         .padding(.horizontal, 24)
@@ -300,6 +305,29 @@ struct CalibrationView: View {
                         }
                         .buttonStyle(.plain)
                         .accessibilityLabel("Quick recalibration, silence floor only")
+
+                        // Returning to the uncalibrated state had no route
+                        // through the UI at all: someone who calibrated in the
+                        // wrong room, or against a speaker they no longer own,
+                        // could only get back by deleting the app. It belongs
+                        // here, beside the thing it undoes.
+                        Button(action: {
+                            if engine.isActive { engine.stop() }
+                            calibrationStore.clear()
+                        }) {
+                            Text("CLEAR CALIBRATION")
+                                .font(.envo(size: 11))
+                                .foregroundColor(.gray)
+                                .kerning(2)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 12)
+                                .overlay(
+                                    Rectangle()
+                                        .stroke(Color.gray.opacity(0.3), lineWidth: 1)
+                                )
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear the saved calibration profile")
                     }
                 }
                 .padding(.horizontal, 24)

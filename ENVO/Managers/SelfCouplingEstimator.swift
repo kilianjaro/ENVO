@@ -73,9 +73,9 @@ import Foundation
 ///     makes the loop *less* willing to raise the volume. Over-correction is
 ///     negative feedback on ENVO's own output; it can only damp.
 ///
-/// The estimate starts at zero and stays there until several consistent
-/// observations agree, so an unconverged estimator behaves exactly like no
-/// estimator.
+/// And the applied value is clamped to 0…1 regardless of what a single noisy
+/// observation reported, so no probe can push the correction outside what the
+/// physics allows.
 struct SelfCouplingEstimator: Equatable {
 
     // MARK: - Tuning
@@ -128,6 +128,21 @@ struct SelfCouplingEstimator: Equatable {
 
     private var smoothed: Float?
     private(set) var observationCount: Int = 0
+
+    /// The most recently accepted observation, for the diagnostic log. Whether
+    /// this ever gets populated in real use is the open question about this
+    /// whole type — a session where it stays nil means the correction ran
+    /// entirely on the route prior.
+    struct Observation: Equatable {
+        var raw: Float
+        var accepted: Float
+        var stepDB: Float
+        var preFloorDB: Float
+        var postFloorDB: Float
+        var previousEstimate: Float?
+        var newEstimate: Float
+    }
+    private(set) var lastObservation: Observation?
 
     /// How much of the measured floor is ENVO's own output, 0…1.
     /// The route-implied prior until something has actually been measured.
@@ -207,9 +222,17 @@ struct SelfCouplingEstimator: Equatable {
             let bounded = AcousticMath.clamp(observed, 0, 1.2)
             // The first measurement replaces the route-implied guess outright;
             // afterwards they smooth together.
+            let previous = smoothed
             smoothed = smoothed.map { retention * $0 + (1 - retention) * bounded }
                 ?? bounded
             observationCount += 1
+            lastObservation = Observation(raw: observed,
+                                          accepted: bounded,
+                                          stepDB: pendingStepDB,
+                                          preFloorDB: pre,
+                                          postFloorDB: mean(postWindow),
+                                          previousEstimate: previous,
+                                          newEstimate: smoothed ?? bounded)
         }
 
         abandonPending(restartingFrom: floorDB)
@@ -226,6 +249,7 @@ struct SelfCouplingEstimator: Equatable {
         ticksSinceStep = 0
         smoothed = nil
         observationCount = 0
+        lastObservation = nil
     }
 
     /// Throw away an observation in flight but keep what has been learned.

@@ -20,6 +20,7 @@ final class SettingsStore: ObservableObject {
         static let autoResume     = "envo.settings.autoResume"
         static let wasActive      = "envo.settings.wasActive"
         static let onboarded      = "envo.settings.onboarded"
+        static let diagnostics    = "envo.settings.diagnostics"
     }
 
     // MARK: - Engine preferences
@@ -38,6 +39,11 @@ final class SettingsStore: ObservableObject {
 
     /// True once the user has seen the onboarding sheet.
     @Published var hasCompletedOnboarding: Bool
+
+    /// Write a per-tick diagnostic CSV while the engine runs. Off by default:
+    /// nothing about normal use should depend on it, and a diagnostic that runs
+    /// unasked is one nobody trusts. See DiagnosticLog.
+    @Published var diagnosticsEnabled: Bool
 
     private var cancellables = Set<AnyCancellable>()
     private let defaults: UserDefaults
@@ -60,6 +66,11 @@ final class SettingsStore: ObservableObject {
         self.autoResume    = defaults.object(forKey: Key.autoResume) as? Bool ?? false
         self.wasActive     = defaults.object(forKey: Key.wasActive) as? Bool ?? false
         self.hasCompletedOnboarding = defaults.object(forKey: Key.onboarded) as? Bool ?? false
+        self.diagnosticsEnabled = defaults.object(forKey: Key.diagnostics) as? Bool ?? false
+
+        // Only after every stored property is initialised: this reaches outside
+        // the type, and Swift will not let `self` be read before then.
+        DiagnosticLog.shared.isEnabled = diagnosticsEnabled
 
         wireUp()
     }
@@ -113,6 +124,14 @@ final class SettingsStore: ObservableObject {
             .dropFirst()
             .sink { [weak self] v in
                 self?.defaults.set(v, forKey: Key.onboarded)
+            }
+            .store(in: &cancellables)
+
+        $diagnosticsEnabled
+            .dropFirst()
+            .sink { [weak self] v in
+                self?.defaults.set(v, forKey: Key.diagnostics)
+                DiagnosticLog.shared.isEnabled = v
             }
             .store(in: &cancellables)
     }

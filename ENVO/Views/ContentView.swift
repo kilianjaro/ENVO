@@ -13,6 +13,13 @@ struct ContentView: View {
     @State private var showInfo = false
     @State private var showOnboarding = false
 
+    #if DEBUG
+    /// Bumped to force the diagnostics section to re-read the log directory,
+    /// which is filesystem state SwiftUI cannot observe.
+    @State private var logRefreshToken = 0
+    @State private var listenerMarkCount = 0
+    #endif
+
     var body: some View {
         Group {
             if audioManager.permissionState == .denied {
@@ -224,6 +231,8 @@ struct ContentView: View {
             .buttonStyle(.plain)
             .accessibilityLabel(engine.isCalibrated ? "Recalibrate room" : "Calibrate room")
 
+            markButton
+
             // The GAP badge used to live here. It reported a diagnostic that
             // stopped meaning anything once ambient tracking no longer needed
             // pauses in playback to read the room — and with nothing playing it
@@ -343,9 +352,8 @@ struct ContentView: View {
     }
 
     private var offsetColor: Color {
-        // Matches `engine.displayOffset`, which reports what the hardware
-        // delivered rather than what the control law intended.
-        let offsetDB = engine.deliveredOffsetDB
+        // Matches `engine.displayOffset`, which reports the control law's intent.
+        let offsetDB = engine.currentOffsetDB
         if offsetDB > 0.05 { return .white }
         if offsetDB < -0.05 { return .gray }
         return .white.opacity(0.5)
@@ -653,6 +661,10 @@ struct ContentView: View {
 
                         optionsSection
 
+                        #if DEBUG
+                        diagnosticsSection
+                        #endif
+
                         Spacer().frame(height: 40)
                     }
                     .padding(.horizontal, 24)
@@ -721,6 +733,108 @@ struct ContentView: View {
                 .lineSpacing(5)
                 .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // MARK: - Diagnostics
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// Tuning and verification controls. **Debug builds only** — see
+    /// `DiagnosticLog` for why the gate is here and not at each call site.
+    ///
+    /// Deliberately in the info panel rather than on the main screen: this is for
+    /// establishing whether the constants are right on real hardware, which is
+    /// not something a listener should trip over by accident. The one exception
+    /// is the MARK button, which has to be reachable in one tap while listening —
+    /// see `markButton`.
+    #if DEBUG
+    private var diagnosticsSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("DIAGNOSTICS")
+                .font(.envo(size: 10))
+                .foregroundColor(.white)
+                .kerning(4)
+
+            Text("Records one row per second to a CSV file while ENVO runs: measured levels, the six octave bands, the noise floor, the speech scores, the self-coupling estimate and every volume step. Levels only — no audio, and nothing leaves the device unless you share it.\n\nWith the phone tethered to a Mac you can also watch it live in Console.app: filter on category \"diag\".")
+                .font(.envo(size: 12))
+                .foregroundColor(.white.opacity(0.6))
+                .lineSpacing(5)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Toggle(isOn: $settings.diagnosticsEnabled) {
+                Text("RECORD A SESSION LOG")
+                    .font(.envo(size: 11))
+                    .foregroundColor(.white)
+                    .kerning(2)
+            }
+            .tint(.white)
+
+            let logs = DiagnosticLog.shared.existingLogs()
+            if let newest = logs.first {
+                HStack(spacing: 10) {
+                    ShareLink(item: newest) {
+                        Text("SHARE NEWEST LOG")
+                            .font(.envo(size: 10))
+                            .foregroundColor(.black)
+                            .kerning(2)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(Color.white)
+                    }
+
+                    Button(action: {
+                        DiagnosticLog.shared.deleteAllLogs()
+                        logRefreshToken += 1
+                    }) {
+                        Text("DELETE ALL")
+                            .font(.envo(size: 10))
+                            .foregroundColor(.gray)
+                            .kerning(2)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .overlay(Rectangle().stroke(Color.gray.opacity(0.4), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                Text("\(logs.count) log\(logs.count == 1 ? "" : "s") · newest \(newest.lastPathComponent)")
+                    .font(.envo(size: 9))
+                    .foregroundColor(.white.opacity(0.4))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+        }
+        .id(logRefreshToken)
+    }
+    #endif
+
+    /// One tap to stamp "this is the moment it sounded wrong" into the log.
+    ///
+    /// The whole point of the diagnostic file is to line up numbers against
+    /// perception, and perception has to be recorded *when it happens* — a note
+    /// written afterwards cannot say which second it referred to. Only shown
+    /// while actually recording, so it never clutters normal use.
+    @ViewBuilder
+    private var markButton: some View {
+        #if DEBUG
+        if settings.diagnosticsEnabled, engine.isActive {
+            Button(action: {
+                listenerMarkCount += 1
+                DiagnosticLog.shared.mark("#\(listenerMarkCount)")
+                Haptics.bump()
+            }) {
+                Text("MARK \(listenerMarkCount > 0 ? "· \(listenerMarkCount)" : "")")
+                    .font(.envo(size: 9))
+                    .foregroundColor(.white)
+                    .kerning(2)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .overlay(Rectangle().stroke(Color.white.opacity(0.5), lineWidth: 1))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Mark this moment in the diagnostic log")
+        }
+        #endif
     }
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

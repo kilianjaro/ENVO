@@ -26,12 +26,18 @@ import AVFoundation
 ///
 /// ON `mode`
 /// ---------
-/// `.default` rather than `.measurement`. Measurement mode gives a cleaner
-/// input signal (no processing) but costs route-wide output attenuation,
-/// which is unacceptable for an app whose entire job is managing how loud
-/// music sounds. ENVO measures *relative* level changes against a baseline
-/// captured through the same path, so input processing affects both the
-/// baseline and the reading and largely cancels.
+/// `.default`, deliberately and permanently. `.measurement` would switch off
+/// iOS's input processing — including the automatic gain control that compresses
+/// the decibel scale — but it also bypasses the *output* processing chain for the
+/// whole route, so every app's playback drops the moment ENVO activates. In an
+/// app whose entire purpose is managing how loud music is, that trade is not
+/// available at any price.
+///
+/// The cost is measured and accepted: on an iPhone 14 a room change verified at
+/// 20 dB on a sound level meter read as 15.6 dB at the tap, a slope of 0.78. It
+/// is paid for in `EnvoEngine.compensationGain` instead, which is raised to suit.
+/// The scale is therefore approximate by design; the app adapts usefully rather
+/// than accurately, which is the right trade for a background utility.
 ///
 /// ON `.mixWithOthers`
 /// -------------------

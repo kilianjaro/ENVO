@@ -14,4 +14,9 @@ enum Log {
     static let volume  = Logger(subsystem: subsystem, category: "volume")
     static let session = Logger(subsystem: subsystem, category: "session")
     static let general = Logger(subsystem: subsystem, category: "general")
+
+    /// Tuning and verification traces. Its own category so a tethered Mac can
+    /// watch a listening session in Console.app without every other subsystem
+    /// interleaving into it — filter on category `diag`.
+    static let diag = Logger(subsystem: subsystem, category: "diag")
 }

@@ -128,6 +128,48 @@ final class MaskingWeightingTests: XCTestCase {
                              "the two must be separable by a ramp, not just ordered")
     }
 
+    /// Real octave-band levels from an iPhone 14 measuring broadband pink noise
+    /// through its own microphone, at five different room levels
+    /// (`envo-diag-20260730-131523.csv`).
+    ///
+    /// These exist because a guess got this wrong. The speech ramp was originally
+    /// calibrated on invented spectra with 30 dB tilts across octaves, which no
+    /// real room produces — and on real hardware plain pink noise scored 1.00 on
+    /// the spectral term, putting `speechLikeness` just past the Lombard damper's
+    /// engage threshold. ENVO was damping its response to ordinary noise.
+    static let measuredPinkNoiseBands: [[Float]] = [
+        [-37.5, -42.6, -42.6, -40.5, -46.3, -51.2],
+        [-30.7, -35.4, -35.5, -33.5, -39.4, -44.4],
+        [-22.9, -27.6, -27.3, -25.1, -31.0, -36.0],
+        [-29.9, -33.8, -33.7, -31.8, -37.5, -42.6],
+        [-38.3, -42.7, -42.5, -40.4, -46.3, -51.3],
+    ]
+
+    /// The share of a broadband signal has a floor well above zero, because four
+    /// of the six bands are in the numerator. Any ramp has to start above it.
+    func testBroadbandNoiseShareSitsWellAboveZero() {
+        for bands in Self.measuredPinkNoiseBands {
+            let share = MaskingWeighting.speechBandShare(bands, activeBandCount: allBands)
+            XCTAssertGreaterThan(share, 0.50,
+                                 "broadband noise cannot read as low as LF-dominated noise")
+            XCTAssertLessThan(share, 0.65,
+                              "…but it must stay below where speech babble sits")
+        }
+    }
+
+    /// The regression that matters: measured broadband noise must be separable
+    /// from speech by a ramp, at every level it was recorded at.
+    func testMeasuredNoiseIsSeparableFromSpeechShapedNoise() {
+        let babble: [Float] = [-40, -36, -33, -35, -40, -48]   // speech-shaped
+        let babbleShare = MaskingWeighting.speechBandShare(babble, activeBandCount: allBands)
+
+        for bands in Self.measuredPinkNoiseBands {
+            let pinkShare = MaskingWeighting.speechBandShare(bands, activeBandCount: allBands)
+            XCTAssertGreaterThan(babbleShare - pinkShare, 0.15,
+                                 "the gap must be wide enough for a ramp to sit in")
+        }
+    }
+
     /// Anything covering a microphone is a low-pass. This ratio is what lets
     /// `ObstructionDetector` tell a pocket from a room that went quiet.
     func testHighFrequencyShareCollapsesWhenMuffled() {

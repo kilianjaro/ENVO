@@ -55,6 +55,23 @@ struct VolumeTaper: Equatable {
     /// taper, the range or the control law say. Enforced again at the point
     /// of application in `VolumeController`, because a limit is only worth
     /// having where it actually touches the hardware.
+    ///
+    /// HEADROOM AGAINST THE RANGE SETTINGS
+    /// -----------------------------------
+    /// A quarter of the slider is 15 dB on the default 60 dB/slider taper and
+    /// about 11 dB on a measured 45 dB/slider one, so it sits comfortably above
+    /// the widest range ENVO offers (±9 dB, which needs 0.20 of travel on a
+    /// measured taper). It is a genuine backstop rather than the working limit.
+    ///
+    /// That headroom is not automatic, and it is worth re-deriving before any
+    /// change to `RangeMode`: a range wider than about ±11 dB would be silently
+    /// clipped here on a calibrated device, and the control would then display a
+    /// number the code could not honour — exactly the class of defect this type
+    /// was written to eliminate.
+    ///
+    /// `maxSliderDelta(forRangeDB:)` takes the smaller of this and what the
+    /// selected range actually needs, so choosing ±3 still confines ENVO to
+    /// about 0.07 of travel. The guard stays proportionate to what was asked for.
     static let absoluteMaxDelta: Float = 0.25
 
     /// Below this the slider is effectively muted and the curve is not
